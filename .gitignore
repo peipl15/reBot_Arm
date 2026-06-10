@@ -6,10 +6,9 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-outputs/*.csv
+# Calibration CSVs and motor-param dumps in outputs/ ARE tracked — they are
+# small, stable baseline data. Only big runtime logs / data dumps are ignored.
 outputs/*.parquet
-outputs/*.txt
 outputs/*.log
-!outputs/.gitkeep
 
 .DS_Store

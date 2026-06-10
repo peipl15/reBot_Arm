@@ -1,11 +1,20 @@
-# Joint configuration for Seeed reBot 7-DOF arm
+# Joint configuration for Seeed reBot 7-DOF arm.
+#
 # Coordinates: motor "native" frame (encoder direction as wired).
 #   sign converts to "user/URDF" frame:  user_pos = sign * motor_pos
-# Generated from outputs/motor_params_20260610_151211.txt (PMAX/VMAX/TMAX read).
-# Soft limits are PLACEHOLDERS — Phase 2 ramp test will overwrite them.
-
-# Default vlim is conservative: 5% of VMAX for heavy joints, 3% for light joints.
-# Watchdog ratios are applied against tmax_fw (firmware torque max).
+#
+# Hardware params (pmax_fw/vmax_fw/tmax_fw) sourced from
+#   outputs/motor_params_20260610_151211.txt (raw register dump).
+# Soft limits backfilled from Phase 2 ramp characterization on 2026-06-10
+#   (outputs/range_j{1..7}_*.csv).
+#
+# Semantic naming refined per user mental model on 2026-06-10:
+#   j4 = wrist_flex (上抬), j5 = wrist_yaw (左右水平), j6 = wrist_roll (径向).
+#
+# Sign flips for j2 and j3 (from -1 to +1) because the bending-with-gravity
+# direction (= our test's NEG side) is what users intuitively call "+90°"
+# in their mental model — i.e. "elbow bent up to 90°" or "shoulder dropped
+# 90°" should be commanded as positive in user code.
 
 defaults:
   transport: dm-device
@@ -20,6 +29,8 @@ defaults:
     status_must_be: 1             # any other status_code aborts
 
 joints:
+  # j1 base — asymmetric: POS dir hits cable/stop at ~+37°, NEG dir free
+  # for almost a full revolution. Soft limits: -3.05 (-175°) to +0.60 (+34°).
   - index: 1
     id: 0x01
     feedback_id: 0x11
@@ -29,84 +40,99 @@ joints:
     pmax_fw: 12.5
     vmax_fw: 10.0
     tmax_fw: 28.0
-    soft_min: -0.10   # PLACEHOLDER, overwritten by Phase 2 calibration
-    soft_max: +0.10   # PLACEHOLDER
+    soft_min: -3.05
+    soft_max: +0.60
     vlim_default: 0.5
 
+  # j2 shoulder — sign FLIPPED. Range 0..+90° = drop with gravity. The
+  # +ve direction in user frame now drops the upper arm; -ve would lift
+  # against gravity and is locked out (soft_min=0).
   - index: 2
     id: 0x02
     feedback_id: 0x12
     name: shoulder
     model: "4340"
-    sign: -1          # observed reversed vs URDF on 2026-06-09
+    sign: +1          # flipped from -1 on 2026-06-10 per gravity-aware sign convention
     pmax_fw: 12.5
     vmax_fw: 10.0
     tmax_fw: 28.0
-    soft_min: -0.10
-    soft_max: +0.10
+    soft_min: 0.0
+    soft_max: +1.5708 # +90°
     vlim_default: 0.5
 
+  # j3 elbow — sign FLIPPED. Same pattern as j2: +ve = bend with gravity,
+  # locked at 0 on the lift-against-gravity side.
+  # Wider +135° is mechanically reachable only when j2 is vertical;
+  # static config keeps +90° as universally safe.
   - index: 3
     id: 0x03
     feedback_id: 0x13
     name: elbow
     model: "4340"
-    sign: -1          # observed reversed vs URDF on 2026-06-09
+    sign: +1          # flipped from -1 on 2026-06-10
     pmax_fw: 12.5
     vmax_fw: 10.0
     tmax_fw: 28.0
-    soft_min: -0.10
-    soft_max: +0.10
+    soft_min: 0.0
+    soft_max: +1.5708 # +90°
     vlim_default: 0.5
 
+  # j4 wrist_flex (上抬 — wrist lifts) — asymmetric 0..+90°.
   - index: 4
     id: 0x04
     feedback_id: 0x14
-    name: forearm        # confirm naming with hardware doc
+    name: wrist_flex
     model: "4340"
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
     tmax_fw: 10.0
-    soft_min: -0.10
-    soft_max: +0.10
+    soft_min: 0.0
+    soft_max: +1.5708 # +90°
     vlim_default: 1.0
 
+  # j5 wrist_yaw (左右水平转向) — symmetric ±85° (5° buffer from ±90° cap).
   - index: 5
     id: 0x05
     feedback_id: 0x15
-    name: wrist_1        # confirm naming with hardware doc
+    name: wrist_yaw
     model: "4340"
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
     tmax_fw: 10.0
-    soft_min: -0.10
-    soft_max: +0.10
+    soft_min: -1.484  # -85°
+    soft_max: +1.484  # +85°
     vlim_default: 1.0
 
+  # j6 wrist_roll (径向旋转) — near-continuous. ±175° (5° buffer from ±180°).
   - index: 6
     id: 0x06
     feedback_id: 0x16
-    name: wrist_2        # confirm naming with hardware doc
+    name: wrist_roll
     model: "4340"
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
     tmax_fw: 10.0
-    soft_min: -0.10
-    soft_max: +0.10
+    soft_min: -3.05   # -175°
+    soft_max: +3.05   # +175°
     vlim_default: 1.0
 
+  # j7 gripper — screw-driven, asymmetric. +0.04 rad (+2°) is just inside
+  # the close-side torque trip at +4°. -6.00 rad (-344°) gives ~8° buffer
+  # from the open-side torque trip at -352°. Backlash: encoder=0 may not
+  # always be physically closed; "close" command should target +0.04
+  # (motor will press into hard stop and force-close).
   - index: 7
     id: 0x07
     feedback_id: 0x17
-    name: wrist_3        # confirm naming with hardware doc
+    name: gripper
     model: "4340"
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
     tmax_fw: 10.0
-    soft_min: -0.10
-    soft_max: +0.10
+    soft_min: -6.00   # -344°
+    soft_max: +0.04   # +2.3°
     vlim_default: 1.0

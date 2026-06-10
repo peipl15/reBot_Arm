@@ -143,6 +143,7 @@ class ArmController:
         hold_s: float = 0.0,
         raise_on_clamp: bool = False,
         loop_dt_s: float = 0.02,
+        check_tracking_error: bool = True,
     ) -> None:
         """Send a pos-vel command in user frame.
 
@@ -153,6 +154,11 @@ class ArmController:
         If hold_s > 0, the command is re-issued every loop_dt_s for hold_s
         seconds while a Watchdog checks each feedback sample. Any watchdog
         trip immediately disables all motors and raises ArmSafetyError.
+
+        check_tracking_error=False disables only the tracking watchdog for
+        this call (torque + status still active). Use for long traversals
+        where transient large |target - actual| is normal because the motor
+        physically needs time to cover the distance at vlim.
         """
         j = self._joint_cfg(index)
         m = self._motor(index)
@@ -179,7 +185,12 @@ class ArmController:
             return
 
         # held command with watchdog
-        wd = Watchdog(j, self.cfg.watchdog)
+        wd_cfg = self.cfg.watchdog
+        if not check_tracking_error:
+            # Bypass the tracking check while keeping torque + status active.
+            from dataclasses import replace as _replace
+            wd_cfg = _replace(wd_cfg, tracking_error_rad=float("inf"))
+        wd = Watchdog(j, wd_cfg)
         t_end = time.monotonic() + hold_s
         while time.monotonic() < t_end:
             m.send_pos_vel(target_motor, vlim)

@@ -165,6 +165,32 @@ def test_move_with_hold_healthy_completes(sample_cfg, mock_mb_ctrl):
     assert arm._motors[5].send_pos_vel.call_count >= 2
 
 
+def test_check_tracking_error_false_ignores_tracking_violation(sample_cfg, mock_mb_ctrl):
+    """With check_tracking_error=False, large |target-actual| should NOT trip,
+    even held past the timeout. torque + status still active.
+    """
+    arm = ArmController(sample_cfg).open(mock_mb_ctrl)
+    # target far away from actual — would trip tracking watchdog if enabled
+    arm._motors[5].get_state.return_value = make_state(
+        pos=0.0, torq=0.0, status_code=1
+    )
+    # j5 soft is [-1.0, +1.0], so target=0.5 is in-bounds (no clamp)
+    # actual_user=0 vs target=0.5 → err=0.5 > 0.05 every sample
+    # With check_tracking_error=False this should complete without raising
+    arm.move_joint(5, 0.5, vlim=0.5, hold_s=0.05,
+                   loop_dt_s=0.01, check_tracking_error=False)
+
+
+def test_check_tracking_error_false_still_catches_torque(sample_cfg, mock_mb_ctrl):
+    """Tracking disabled, but torque trip still works."""
+    arm = ArmController(sample_cfg).open(mock_mb_ctrl)
+    arm._motors[5].get_state.return_value = make_state(torq=9.0, status_code=1)
+    with pytest.raises(ArmSafetyError) as ei:
+        arm.move_joint(5, 0.5, vlim=0.5, hold_s=0.1,
+                       loop_dt_s=0.01, check_tracking_error=False)
+    assert ei.value.event.kind == "torque"
+
+
 # ---------- enable / disable lifecycle ----------
 
 def test_disable_all_swallows_per_motor_errors(sample_cfg, mock_mb_ctrl):
