@@ -39,3 +39,22 @@ scripts/     standalone runnable scripts (characterize_range, sanity_walk, ...)
 tests/       pytest unit tests (mocked motorbridge)
 outputs/     calibration CSVs and run logs (gitignored)
 ```
+
+## Running tests
+
+ROS2 Humble (`/opt/ros/humble`) is on `PYTHONPATH` by default in this shell and
+its `launch_testing` pytest plugin entry-point gets discovered, but its `lark`
+dep is missing from this venv — pytest then fails to start. Clear PYTHONPATH
+for test runs:
+
+```bash
+env -u PYTHONPATH python3 -m pytest tests/ -v
+```
+
+## Running the dry-run sanity check
+
+```bash
+python3 scripts/dry_run.py
+```
+
+No hardware contact; prints the loaded joint config in a table.
