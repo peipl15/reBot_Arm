@@ -1,0 +1,27 @@
+[project]
+name = "rebot-arm"
+version = "0.1.0"
+description = "Python wrapper for Seeed reBot 7-DOF arm via motorbridge (Damiao DM-USB2FDCAN)"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "motorbridge>=0.4.5",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "ruff>=0.4",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["arm*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

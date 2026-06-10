@@ -1,0 +1,112 @@
+# Joint configuration for Seeed reBot 7-DOF arm
+# Coordinates: motor "native" frame (encoder direction as wired).
+#   sign converts to "user/URDF" frame:  user_pos = sign * motor_pos
+# Generated from outputs/motor_params_20260610_151211.txt (PMAX/VMAX/TMAX read).
+# Soft limits are PLACEHOLDERS — Phase 2 ramp test will overwrite them.
+
+# Default vlim is conservative: 5% of VMAX for heavy joints, 3% for light joints.
+# Watchdog ratios are applied against tmax_fw (firmware torque max).
+
+defaults:
+  transport: dm-device
+  dm_device_type: usb2canfd-dual
+  dm_channel: 0
+  feedback_dt_ms: 20
+  watchdog:
+    torque_warn_ratio: 0.60       # log warning above this fraction of TMAX
+    torque_abort_ratio: 0.80      # disable + raise above this fraction of TMAX
+    tracking_error_rad: 0.05      # |cmd - actual| > this is suspicious
+    tracking_error_timeout_s: 0.5 # ... for this long, abort
+    status_must_be: 1             # any other status_code aborts
+
+joints:
+  - index: 1
+    id: 0x01
+    feedback_id: 0x11
+    name: base
+    model: "4340"
+    sign: +1
+    pmax_fw: 12.5
+    vmax_fw: 10.0
+    tmax_fw: 28.0
+    soft_min: -0.10   # PLACEHOLDER, overwritten by Phase 2 calibration
+    soft_max: +0.10   # PLACEHOLDER
+    vlim_default: 0.5
+
+  - index: 2
+    id: 0x02
+    feedback_id: 0x12
+    name: shoulder
+    model: "4340"
+    sign: -1          # observed reversed vs URDF on 2026-06-09
+    pmax_fw: 12.5
+    vmax_fw: 10.0
+    tmax_fw: 28.0
+    soft_min: -0.10
+    soft_max: +0.10
+    vlim_default: 0.5
+
+  - index: 3
+    id: 0x03
+    feedback_id: 0x13
+    name: elbow
+    model: "4340"
+    sign: -1          # observed reversed vs URDF on 2026-06-09
+    pmax_fw: 12.5
+    vmax_fw: 10.0
+    tmax_fw: 28.0
+    soft_min: -0.10
+    soft_max: +0.10
+    vlim_default: 0.5
+
+  - index: 4
+    id: 0x04
+    feedback_id: 0x14
+    name: forearm        # confirm naming with hardware doc
+    model: "4340"
+    sign: +1
+    pmax_fw: 12.5
+    vmax_fw: 30.0
+    tmax_fw: 10.0
+    soft_min: -0.10
+    soft_max: +0.10
+    vlim_default: 1.0
+
+  - index: 5
+    id: 0x05
+    feedback_id: 0x15
+    name: wrist_1        # confirm naming with hardware doc
+    model: "4340"
+    sign: +1
+    pmax_fw: 12.5
+    vmax_fw: 30.0
+    tmax_fw: 10.0
+    soft_min: -0.10
+    soft_max: +0.10
+    vlim_default: 1.0
+
+  - index: 6
+    id: 0x06
+    feedback_id: 0x16
+    name: wrist_2        # confirm naming with hardware doc
+    model: "4340"
+    sign: +1
+    pmax_fw: 12.5
+    vmax_fw: 30.0
+    tmax_fw: 10.0
+    soft_min: -0.10
+    soft_max: +0.10
+    vlim_default: 1.0
+
+  - index: 7
+    id: 0x07
+    feedback_id: 0x17
+    name: wrist_3        # confirm naming with hardware doc
+    model: "4340"
+    sign: +1
+    pmax_fw: 12.5
+    vmax_fw: 30.0
+    tmax_fw: 10.0
+    soft_min: -0.10
+    soft_max: +0.10
+    vlim_default: 1.0

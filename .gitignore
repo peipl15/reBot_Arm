@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+outputs/*.csv
+outputs/*.parquet
+outputs/*.txt
+outputs/*.log
+!outputs/.gitkeep
+
+.DS_Store
