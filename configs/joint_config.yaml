@@ -29,8 +29,14 @@ defaults:
     status_must_be: 1             # any other status_code aborts
 
 joints:
-  # j1 base — asymmetric: POS dir hits cable/stop at ~+37°, NEG dir free
-  # for almost a full revolution. Soft limits: -3.05 (-175°) to +0.60 (+34°).
+  # j1 base — asymmetric: cable/torque-trip on one side, free-spinning on
+  # the other. Original Phase 2 calibration (2026-06-10) on the OLD encoder
+  # zero: soft=[-3.05, +0.60]. On 2026-06-16 the encoder was re-zeroed at a
+  # position +1.4868 rad from the old zero (set_joint_zero.py at user's
+  # request, persisted to flash) so the same physical hardstops now sit at
+  # +1.4868 rad offset in the new frame:
+  #   new_soft_min = old_soft_min + 1.4868 = -1.563 → use -1.50 (~3° buffer)
+  #   new_soft_max = old_soft_max + 1.4868 = +2.087 → use +2.05 (~2° buffer)
   - index: 1
     id: 0x01
     feedback_id: 0x11
@@ -40,13 +46,16 @@ joints:
     pmax_fw: 12.5
     vmax_fw: 10.0
     tmax_fw: 28.0
-    soft_min: -3.05
-    soft_max: +0.60
+    soft_min: -1.50
+    soft_max: +2.05
     vlim_default: 0.5
 
-  # j2 shoulder — sign FLIPPED. Range 0..+90° = drop with gravity. The
-  # +ve direction in user frame now drops the upper arm; -ve would lift
-  # against gravity and is locked out (soft_min=0).
+  # j2 shoulder — sign FLIPPED. + = drop with gravity, - is locked out.
+  # Phase 2 (2026-06-10) capped soft_max at +90° because that was the
+  # --max-deg test cap, NOT a torque trip. Teleop test on 2026-06-16
+  # confirmed leader can ask for up to +170° (Seeed range_max) and
+  # follower follows it cleanly. Expanded soft_max to +180° (+π) per user
+  # request — leader can now drive full natural fold.
   - index: 2
     id: 0x02
     feedback_id: 0x12
@@ -57,13 +66,15 @@ joints:
     vmax_fw: 10.0
     tmax_fw: 28.0
     soft_min: 0.0
-    soft_max: +1.5708 # +90°
+    soft_max: +3.1416  # +180°
     vlim_default: 0.5
 
-  # j3 elbow — sign FLIPPED. Same pattern as j2: +ve = bend with gravity,
-  # locked at 0 on the lift-against-gravity side.
-  # Wider +135° is mechanically reachable only when j2 is vertical;
-  # static config keeps +90° as universally safe.
+  # j3 elbow — sign FLIPPED. + = bend with gravity, - is locked out.
+  # Same expansion as j2: Phase 2 cap at +90° was the test --max-deg, not
+  # a hardstop. Expanded to +180° on 2026-06-16 per user request after
+  # teleop revealed real range is much wider. Self-collision when j3 > 90°
+  # with j2 horizontal is the user's responsibility to avoid (no
+  # pose-dependent collision check in the wrapper).
   - index: 3
     id: 0x03
     feedback_id: 0x13
@@ -74,10 +85,18 @@ joints:
     vmax_fw: 10.0
     tmax_fw: 28.0
     soft_min: 0.0
-    soft_max: +1.5708 # +90°
+    soft_max: +3.1416  # +180°
     vlim_default: 0.5
 
-  # j4 wrist_flex (上抬 — wrist lifts) — asymmetric 0..+90°.
+  # j4 wrist_flex (上抬 — wrist lifts).
+  # Phase 2 (2026-06-10) recorded a torque trip at -6° in NEG direction and
+  # we set soft_min=0 thinking that was the mechanical limit. During first
+  # teleop test (2026-06-16) the user observed j4 CAN actually go negative
+  # when other joints (j5/j6/etc.) are in different positions — the -6° trip
+  # was a posture-dependent self-collision, not the wrist motor's hardstop.
+  # Expanded soft_min to -80° (-1.396 rad) per user spec. If self-collision
+  # is a concern in some poses, a higher-layer collision-check is needed;
+  # the wrapper soft limit can't be pose-dependent.
   - index: 4
     id: 0x04
     feedback_id: 0x14
@@ -87,8 +106,8 @@ joints:
     pmax_fw: 12.5
     vmax_fw: 30.0
     tmax_fw: 10.0
-    soft_min: 0.0
-    soft_max: +1.5708 # +90°
+    soft_min: -1.396   # -80°
+    soft_max: +1.5708  # +90°
     vlim_default: 1.0
 
   # j5 wrist_yaw (左右水平转向) — symmetric ±85° (5° buffer from ±90° cap).

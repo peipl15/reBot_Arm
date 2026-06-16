@@ -1,11 +1,14 @@
 [project]
 name = "rebot-arm"
 version = "0.1.0"
-description = "Python wrapper for Seeed reBot 7-DOF arm via motorbridge (Damiao DM-USB2FDCAN)"
+description = "Python wrapper for Seeed reBot 7-DOF arm via motorbridge (Damiao DM-USB2FDCAN), with leader-arm teleop"
 requires-python = ">=3.10,<3.12"
 dependencies = [
     "motorbridge>=0.4.5",
     "pyyaml>=6.0",
+    # Leader arm 102 (Fashion Star servos) — used by scripts/teleop.py
+    "fashionstar-uart-sdk>=1.3",
+    "motorbridge-smart-servo>=0.0.4",
 ]
 
 [project.optional-dependencies]
