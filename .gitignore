@@ -10,5 +10,10 @@ __pycache__/
 # small, stable baseline data. Only big runtime logs / data dumps are ignored.
 outputs/*.parquet
 outputs/*.log
+# Recorded teleop demos (HDF5) and converted LeRobot datasets (mp4 + parquet)
+# are too big and machine-specific to track in git.
+outputs/demos/
+outputs/lerobot_datasets/
+outputs/training_runs/
 
 .DS_Store

@@ -9,6 +9,11 @@ dependencies = [
     # Leader arm 102 (Fashion Star servos) — used by scripts/teleop.py
     "fashionstar-uart-sdk>=1.3",
     "motorbridge-smart-servo>=0.0.4",
+    # Demo recording — used by scripts/record_demo.py
+    "opencv-python>=4.7",     # C922 capture via cv2.VideoCapture
+    "pyrealsense2>=2.55",     # D435 RGB + depth
+    "h5py>=3.9",              # episode storage
+    "numpy>=1.24,<2.0",       # arrays (also a motorbridge dep)
 ]
 
 [project.optional-dependencies]

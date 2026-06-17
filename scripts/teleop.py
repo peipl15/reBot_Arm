@@ -77,7 +77,7 @@ JOINT_MAP = {
     2: (3, -1, 1.000),   # elbow_flex → elbow
     3: (4, -1, 1.000),   # wrist_flex → wrist_flex
     4: (5, +1, 1.000),   # wrist_yaw → wrist_yaw
-    5: (6, +1, 1.000),   # wrist_roll → wrist_roll
+    5: (6, -1, 1.000),   # wrist_roll: flipped on 2026-06-17 during record_demo test
     6: (7, -1, 6.30),    # gripper: leader 0..+54.6° → follower 0..-6.00 rad
 }
 SERVO_IDS = list(JOINT_MAP.keys())
