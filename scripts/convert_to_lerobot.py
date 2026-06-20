@@ -64,11 +64,15 @@ def parse_args():
     p.add_argument("--robot-type", default="rebot_b601_dm")
     p.add_argument("--limit", type=int, default=None,
                    help="only convert first N episodes (for quick testing)")
-    p.add_argument("--codec", default="h264", choices=["h264", "hevc", "libsvtav1"],
+    p.add_argument("--codec", default="h264",
+                   choices=["h264", "hevc", "libsvtav1", "h264_nvenc", "hevc_nvenc"],
                    help="ffmpeg video codec for LeRobot's mp4 output. "
-                        "h264 (default here) ~5-10x faster encode than libsvtav1 "
-                        "(lerobot's default) but ~2-3x larger files. For 50 episodes "
-                        "h264 takes ~30 min vs ~2.5 h for libsvtav1.")
+                        "h264 (CPU libx264) is the default — surprisingly "
+                        "NOT slower than h264_nvenc here because the conversion "
+                        "bottleneck is LeRobot's per-frame PNG intermediate "
+                        "(written sequentially by image_writer), not the video "
+                        "encode. NVENC option still available if you parallelise "
+                        "the pipeline.")
     return p.parse_args()
 
 
@@ -85,14 +89,38 @@ def main():
         print("  source ~/code/dp_maniskill/.venv/bin/activate")
         sys.exit(1)
 
-    # Monkey-patch encode_video_frames to use our chosen codec — LeRobot
-    # 0.3.2's encode_episode_videos doesn't expose vcodec, but its internal
-    # call resolves the name at call time so this swap takes effect.
+    # Monkey-patch encode_video_frames to use our chosen codec.
+    # LeRobot 0.3.2 has a hard whitelist {h264, hevc, libsvtav1} so passing
+    # h264_nvenc/hevc_nvenc directly is rejected. For nvenc codecs we replace
+    # encode_video_frames entirely with a PyAV-based encoder. For CPU codecs
+    # we just wrap the original.
     _orig_encode = _vu.encode_video_frames
 
-    def _patched_encode(imgs_dir, video_path, fps, **kwargs):
-        kwargs.setdefault("vcodec", args.codec)
-        return _orig_encode(imgs_dir, video_path, fps, **kwargs)
+    if args.codec.endswith("_nvenc"):
+        # PyAV's bundled libavcodec doesn't ship NVENC, only the SYSTEM
+        # ffmpeg does. We shell out to it.
+        import shutil as _shutil
+        import subprocess as _subprocess
+        if _shutil.which("ffmpeg") is None:
+            print("ERROR: --codec nvenc needs system ffmpeg in PATH")
+            sys.exit(1)
+
+        def _patched_encode(imgs_dir, video_path, fps, **kwargs):
+            Path(video_path).parent.mkdir(parents=True, exist_ok=True)
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-framerate", str(int(fps)),
+                "-i", str(Path(imgs_dir) / "frame_%06d.png"),
+                "-c:v", args.codec,
+                "-cq", "28", "-preset", "p4",
+                "-pix_fmt", "yuv420p",
+                str(video_path),
+            ]
+            _subprocess.run(cmd, check=True)
+    else:
+        def _patched_encode(imgs_dir, video_path, fps, **kwargs):
+            kwargs.setdefault("vcodec", args.codec)
+            return _orig_encode(imgs_dir, video_path, fps, **kwargs)
 
     _vu.encode_video_frames = _patched_encode
     # Also patch the name imported into lerobot_dataset.py (it does

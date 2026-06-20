@@ -51,11 +51,39 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=64,
                    help="batch size. RTX 3500 Ada 12GB handles 64 at 640x480 image.")
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--video-backend", default="pyav",
+                   choices=["pyav", "torchcodec", "torchvision"],
+                   help="pyav is the only one that doesn't leak on long DP runs")
     p.add_argument("--save-freq", type=int, default=20_000)
     p.add_argument("--log-freq", type=int, default=200)
     p.add_argument("--seed", type=int, default=1000)
     p.add_argument("--device", default="cuda")
     p.add_argument("--lr", type=float, default=1e-4)
+    # ── Test#2 knobs (the variables EXPERIMENTS.md H1-H3 are about) ──
+    p.add_argument("--backbone", default="resnet18",
+                   choices=["resnet18", "resnet34", "resnet50"],
+                   help="vision encoder. H2: resnet34 vs resnet18.")
+    p.add_argument("--no-crop", action="store_true",
+                   help="H1: drop the LeRobot default crop_shape=(84,84). "
+                        "Use the full input image (random crop is disabled).")
+    p.add_argument("--crop-h", type=int, default=84,
+                   help="random-crop height when --no-crop is NOT set.")
+    p.add_argument("--crop-w", type=int, default=84,
+                   help="random-crop width when --no-crop is NOT set.")
+    p.add_argument("--horizon", type=int, default=8,
+                   help="H3: predicted chunk length. Was 16, default now 8.")
+    p.add_argument("--n-action-steps", type=int, default=2,
+                   help="H3: actions executed before replan. Was 8, default now 2.")
+    p.add_argument("--n-obs-steps", type=int, default=2)
+    p.add_argument("--val-episodes", default=None,
+                   help="held-out episode indices, comma list (e.g. "
+                        "'0,5,12,17,22,27,33,39,44,50') or a fraction "
+                        "(e.g. '0.2'). When set, training uses the "
+                        "complement; val episodes go to eval_ckpt_loss.py. "
+                        "Implemented by writing them into "
+                        "{output_dir}/val_episodes.txt — the training "
+                        "loop itself doesn't see them (LeRobot 0.3 has no "
+                        "first-class train/val split).")
     return p.parse_args()
 
 
@@ -71,11 +99,65 @@ def main():
         )
         from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
         from lerobot.scripts.train import train
+        from lerobot.datasets import video_utils as _vu
     except ImportError as e:
         print(f"ERROR: required imports missing ({e})")
         print("Activate dp_maniskill venv:")
         print("  source ~/code/dp_maniskill/.venv/bin/activate")
         sys.exit(1)
+
+    # torchcodec 0.13's VideoDecoder leaks decoded frame buffers — observed at
+    # 57 GB per worker after a few hundred steps. lerobot 0.3 routes the "pyav"
+    # backend through torchvision.io.VideoReader, which torchvision 0.26 dropped.
+    # We patch decode_video_frames to use PyAV directly: open → decode needed
+    # frames → close (no persistent state across calls).
+    if args.video_backend == "pyav":
+        import av
+
+        def _decode_pyav(video_path, timestamps, tolerance_s, backend=None):
+            container = av.open(str(video_path))
+            try:
+                stream = container.streams.video[0]
+                avg_fps = float(stream.average_rate)
+                time_base = stream.time_base
+                frame_indices = [round(ts * avg_fps) for ts in timestamps]
+                target_idx = min(frame_indices)
+                target_pts = int(target_idx / avg_fps / float(time_base))
+                container.seek(max(target_pts, 0), stream=stream, backward=True)
+                needed = set(frame_indices)
+                found = {}
+                max_idx = max(frame_indices)
+                import torch as _t
+                for frame in container.decode(stream):
+                    ts_sec = float(frame.pts * time_base)
+                    idx = round(ts_sec * avg_fps)
+                    if idx in needed and idx not in found:
+                        arr = frame.to_ndarray(format="rgb24")
+                        found[idx] = _t.from_numpy(arr).permute(2, 0, 1)
+                    if len(found) == len(needed) or idx > max_idx + 2:
+                        break
+                if not found:
+                    raise RuntimeError(f"pyav decoded 0 frames from {video_path}")
+                # For any index we couldn't hit exactly, fall back to nearest decoded.
+                avail = sorted(found.keys())
+                out_frames = []
+                for q in frame_indices:
+                    if q in found:
+                        out_frames.append(found[q])
+                    else:
+                        nearest = min(avail, key=lambda x: abs(x - q))
+                        out_frames.append(found[nearest])
+                tensor = _t.stack(out_frames).type(_t.float32) / 255.0
+                return tensor
+            finally:
+                container.close()
+
+        _vu.decode_video_frames = _decode_pyav
+        # Also patch the binding imported into lerobot_dataset.py
+        from lerobot.datasets import lerobot_dataset as _ds_mod
+        _ds_mod.decode_video_frames = _decode_pyav
+        print("[train_dp] patched decode_video_frames to PyAV "
+              "(workaround for torchcodec OOM)")
 
     dataset_root = Path(args.dataset_root).resolve()
     if not (dataset_root / "meta" / "info.json").exists():
@@ -122,26 +204,46 @@ def main():
     print(f"  input_features:  {list(input_features.keys())}")
     print(f"  output_features: {list(output_features.keys())}")
 
+    # H1: no-crop uses the raw image; we disable random crop entirely by
+    # asking for crop_shape = full input shape. LeRobot 0.3 doesn't accept
+    # crop_shape=None, so we pass the image H/W from the dataset features.
+    if args.no_crop:
+        img_h = third_shape[0]
+        img_w = third_shape[1]
+        crop_shape = (img_h, img_w)
+        crop_is_random = False
+        print(f"[train_dp] H1: crop_shape disabled — using full input "
+              f"{img_h}x{img_w}.")
+    else:
+        crop_shape = (args.crop_h, args.crop_w)
+        crop_is_random = True
+
     policy_cfg = DiffusionConfig(
-        n_obs_steps=2,
+        n_obs_steps=args.n_obs_steps,
+        horizon=args.horizon,
+        n_action_steps=args.n_action_steps,
         normalization_mapping=normalization_mapping,
         input_features=input_features,
         output_features=output_features,
         device=args.device,
         push_to_hub=False,
-        # ResNet18 vision backbone is the LeRobot DP default
-        vision_backbone="resnet18",
-        crop_shape=(84, 84),
+        vision_backbone=args.backbone,
+        crop_shape=crop_shape,
+        crop_is_random=crop_is_random,
         use_separate_rgb_encoder_per_camera=(args.variant == "dual"),
         optimizer_lr=args.lr,
     )
+    print(f"[train_dp] backbone={args.backbone}  crop_shape={crop_shape}  "
+          f"horizon={args.horizon}  n_action_steps={args.n_action_steps}  "
+          f"n_obs_steps={args.n_obs_steps}")
 
     repo_id = args.repo_id or f"local/{dataset_root.name}"
+    # torchcodec (lerobot default) leaks frame buffers — even num_workers=1
+    # OOM'd at 57 GB on this dataset. pyav releases properly.
     dataset_cfg = DatasetConfig(
         repo_id=repo_id,
         root=str(dataset_root),
-        # image_transforms is a required dataclass field — pass its default instance
-        # via the parser config wrapper. Use the type's default factory.
+        video_backend=args.video_backend,
     )
 
     output_dir = Path(args.output_dir) if args.output_dir else (
@@ -169,7 +271,70 @@ def main():
 
     print(f"\nOutput dir: {output_dir}")
     print(f"Steps: {args.steps}  batch_size: {args.batch_size}  device: {args.device}")
+
+    # Record the val episode IDs so eval_ckpt_loss.py can pick them up later.
+    # LeRobot 0.3.2 has no first-class train/val split, so training itself
+    # still sees ALL episodes. The honest val MSE is computed offline by
+    # eval_ckpt_loss.py --val-episodes-file.
+    if args.val_episodes is not None:
+        total_eps = info["total_episodes"]
+        if "," in args.val_episodes:
+            val_ids = [int(x) for x in args.val_episodes.split(",")]
+        else:
+            frac = float(args.val_episodes)
+            assert 0 < frac < 1, f"--val-episodes fraction must be in (0,1), got {frac}"
+            # Deterministic: take a stride through the episode index. Stride
+            # avoids "all val from one collection batch" bias if episodes were
+            # collected in order.
+            n_val = max(1, round(total_eps * frac))
+            stride = total_eps / n_val
+            val_ids = sorted({int(i * stride) for i in range(n_val)})
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        (output_dir.parent / f"{output_dir.name}_val_episodes.txt").write_text(
+            "\n".join(map(str, val_ids)) + "\n"
+        )
+        print(f"[train_dp] val split: {len(val_ids)} held-out episodes -> "
+              f"{output_dir.name}_val_episodes.txt: {val_ids}")
+        print("  (training itself still sees ALL episodes; eval_ckpt_loss "
+              "honors the file when measuring val MSE)")
+
     print(f"\nCalling lerobot.scripts.train.train(cfg)...\n")
+
+    # lerobot 0.3.2's train() calls logging.info(...) everywhere but never
+    # init_logging(), so on the root logger's default WARNING level all
+    # training metrics are silently dropped. We set up the file+console
+    # handlers ourselves so loss/grad_norm/lr/step are captured.
+    #
+    # We must NOT pre-create output_dir: train()'s cfg.validate() raises
+    # FileExistsError if output_dir already exists and resume is False, and it
+    # only creates output_dir lazily (at first checkpoint). So we write the log
+    # to a run-named file in the (already-existing) parent dir instead.
+    from lerobot.utils.utils import init_logging
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    init_logging(log_file=output_dir.parent / f"{output_dir.name}_train.log")
+
+    # make_policy() unconditionally rebuilds cfg.input_features from the
+    # dataset's features (factory.py lines 160-161), erasing any subset we
+    # asked for. The model's RGB encoders are then built for every feature
+    # in the dataset, so dropping keys after make_policy returns is too late.
+    # Fix: patch dataset_to_policy_features at the source so the filtered
+    # set propagates through the WHOLE construction (input_features, stats,
+    # encoder modules, normalization buffers).
+    requested_keys = set(input_features.keys()) | set(output_features.keys())
+    from lerobot.policies import factory as _pf
+    _orig_d2pf = _pf.dataset_to_policy_features
+
+    def _d2pf_filtered(features_dict):
+        feats = _orig_d2pf(features_dict)
+        dropped = [k for k in list(feats.keys()) if k not in requested_keys]
+        for k in dropped:
+            feats.pop(k)
+        if dropped:
+            print(f"[train_dp] filtered out auto-added features: {dropped}")
+        return feats
+
+    _pf.dataset_to_policy_features = _d2pf_filtered
+
     train(train_cfg)
 
 

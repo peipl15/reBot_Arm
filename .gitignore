@@ -16,4 +16,13 @@ outputs/demos/
 outputs/lerobot_datasets/
 outputs/training_runs/
 
+# Model checkpoints / training artifacts — never commit, wherever they land.
+# (training_runs/ above already covers the normal output dir; these are
+# belt-and-suspenders in case a checkpoint is written outside it.)
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+wandb/
+
 .DS_Store
