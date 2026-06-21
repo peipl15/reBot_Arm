@@ -173,7 +173,12 @@ def main():
         },
     }
 
-    ds = LeRobotDataset.create(
+    # lerobot 0.5+ accepts vcodec= and streaming_encoding= as first-class
+    # params. Older 0.3.2 doesn't — fall back to our monkey-patched create
+    # by passing only the older args and letting the patch above handle codec.
+    import inspect as _inspect
+    create_params = _inspect.signature(LeRobotDataset.create).parameters
+    create_kwargs = dict(
         repo_id=repo_id,
         fps=args.fps,
         features=features,
@@ -181,6 +186,15 @@ def main():
         robot_type=args.robot_type,
         use_videos=True,
     )
+    if "vcodec" in create_params:
+        # lerobot 0.5: native codec + streaming support. Skip our PNG-based
+        # monkey-patch entirely — pass codec & streaming directly.
+        create_kwargs["vcodec"] = args.codec
+        if "streaming_encoding" in create_params:
+            create_kwargs["streaming_encoding"] = True
+            print(f"[convert] lerobot 0.5 native: vcodec={args.codec} "
+                  f"streaming_encoding=True (bypasses PNG intermediate)")
+    ds = LeRobotDataset.create(**create_kwargs)
 
     total_frames = 0
     skipped = []
@@ -235,15 +249,21 @@ def convert_one_episode(ds, src: Path, args) -> int:
             # that fails LeRobot's strict timestamp-tolerance check; for DP
             # training the absolute wall-clock doesn't matter, only the
             # sequence of (state, image, action) frames.
-            ds.add_frame(
-                frame={
-                    "observation.state": follower_pos[i].astype(np.float32),
-                    "observation.images.third_person": third_rgb,
-                    "observation.images.wrist": wrist_rgb,
-                    "action": action[i].astype(np.float32),
-                },
-                task=args.task,
-            )
+            frame = {
+                "observation.state": follower_pos[i].astype(np.float32),
+                "observation.images.third_person": third_rgb,
+                "observation.images.wrist": wrist_rgb,
+                "action": action[i].astype(np.float32),
+            }
+            # lerobot 0.5 dropped the task= kwarg on add_frame() and moved
+            # task to be a key inside the frame dict. Detect and adapt.
+            import inspect
+            sig = inspect.signature(ds.add_frame)
+            if "task" in sig.parameters:
+                ds.add_frame(frame=frame, task=args.task)
+            else:
+                frame["task"] = args.task
+                ds.add_frame(frame=frame)
     ds.save_episode()
     return n
 

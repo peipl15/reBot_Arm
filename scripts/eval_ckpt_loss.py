@@ -105,6 +105,40 @@ def main():
         print(f"ERROR: missing import — activate dp_maniskill venv first.\n  {e}")
         sys.exit(1)
 
+    # Lazy-import VLA policies because they need transformers / peft installed
+    # only if the user actually evaluates a VLA ckpt.
+    def _load_policy(model_dir, device):
+        import json as _json
+        cfg = _json.load(open(f"{model_dir}/config.json"))
+        ptype = cfg.get("type", "diffusion")
+        if ptype == "diffusion":
+            return DiffusionPolicy.from_pretrained(str(model_dir)).to(device), None
+        # For VLA policies the dataset batch must be pre-processed by the
+        # PolicyPreprocessor that was saved alongside the ckpt — adds
+        # `observation.language.tokens`, normalizes images, etc.
+        from lerobot.processor import DataProcessorPipeline
+        preproc = DataProcessorPipeline.from_pretrained(
+            str(model_dir), config_filename="policy_preprocessor.json"
+        )
+        if ptype == "smolvla":
+            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+            policy = SmolVLAPolicy.from_pretrained(str(model_dir)).to(device)
+        elif ptype in ("pi0", "pi05"):
+            mod = "pi0" if ptype == "pi0" else "pi05"
+            from importlib import import_module
+            m = import_module(f"lerobot.policies.{mod}.modeling_{mod}")
+            cls = getattr(m, "PI0Policy" if ptype == "pi0" else "PI05Policy")
+            policy = cls.from_pretrained(str(model_dir)).to(device)
+        elif ptype in ("pi0fast", "pi0_fast"):
+            try:
+                from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy as cls
+            except ImportError:
+                from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy as cls
+            policy = cls.from_pretrained(str(model_dir)).to(device)
+        else:
+            raise ValueError(f"unknown policy type {ptype!r} in {model_dir}/config.json")
+        return policy, preproc
+
     patch_pyav()
 
     dataset_root = Path(args.dataset_root).resolve()
@@ -154,7 +188,7 @@ def main():
 
             print(f"\n=== {run_path.name} @ step {step} ===")
             t0 = time.time()
-            policy = DiffusionPolicy.from_pretrained(str(model_dir)).to(args.device)
+            policy, preproc = _load_policy(model_dir, args.device)
             policy.eval()
 
             # Build delta_timestamps the same way training did.
@@ -166,8 +200,20 @@ def main():
             print(f"  input_features: {input_feats}")
 
             fps = info["fps"]
-            obs_dt = [i / fps for i in policy_cfg.observation_delta_indices]
-            act_dt = [i / fps for i in policy_cfg.action_delta_indices]
+            # SmolVLA / pi0 / pi05 don't store observation_delta_indices or
+            # action_delta_indices on the config — they use n_obs_steps +
+            # chunk_size instead. Derive them when missing.
+            obs_di = getattr(policy_cfg, "observation_delta_indices", None)
+            act_di = getattr(policy_cfg, "action_delta_indices", None)
+            if obs_di is None:
+                n_obs = int(getattr(policy_cfg, "n_obs_steps", 1))
+                obs_di = list(range(-(n_obs - 1), 1))
+            if act_di is None:
+                chunk = int(getattr(policy_cfg, "chunk_size",
+                                    getattr(policy_cfg, "horizon", 16)))
+                act_di = list(range(0, chunk))
+            obs_dt = [i / fps for i in obs_di]
+            act_dt = [i / fps for i in act_di]
             delta_ts = {}
             for feat in input_feats:
                 delta_ts[feat] = obs_dt
@@ -187,10 +233,16 @@ def main():
                 video_backend=args.video_backend,
             )
             if val_episode_ids is not None:
-                # episode_data_index["from"][k] / ["to"][k] = first/last+1
-                # global frame index of episode k.
-                ep_from = ds.episode_data_index["from"].tolist()
-                ep_to = ds.episode_data_index["to"].tolist()
+                # lerobot 0.3: ds.episode_data_index["from"][k] / ["to"][k]
+                # lerobot 0.5: ds.meta.episodes is a HF Dataset table with
+                #              dataset_from_index / dataset_to_index columns.
+                if hasattr(ds, "episode_data_index"):
+                    ep_from = ds.episode_data_index["from"].tolist()
+                    ep_to = ds.episode_data_index["to"].tolist()
+                else:
+                    rows = ds.meta.episodes
+                    ep_from = [int(rows[k]["dataset_from_index"]) for k in range(len(rows))]
+                    ep_to = [int(rows[k]["dataset_to_index"]) for k in range(len(rows))]
                 val_indices = []
                 for ep_id in val_episode_ids:
                     val_indices.extend(range(ep_from[ep_id], ep_to[ep_id]))
@@ -222,8 +274,18 @@ def main():
                     batch = {k: (v.to(args.device, non_blocking=True)
                                   if isinstance(v, torch.Tensor) else v)
                              for k, v in batch.items()}
-                    loss, _ = policy.forward(batch)
-                    losses.append(loss.item())
+                    if preproc is not None:
+                        batch = preproc(batch)
+                    out = policy.forward(batch)
+                    # DP returns (loss, output_dict). SmolVLA/pi0/pi05/pi0fast
+                    # return a single dict with key "loss".
+                    if isinstance(out, tuple):
+                        loss = out[0]
+                    elif isinstance(out, dict):
+                        loss = out.get("loss", out.get("ce_loss", None))
+                    else:
+                        loss = out
+                    losses.append(float(loss.item() if hasattr(loss, "item") else loss))
             dt = time.time() - t_eval
 
             mean_loss = sum(losses) / max(1, len(losses))

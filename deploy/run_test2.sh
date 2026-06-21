@@ -24,8 +24,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# venv path differs between local (rebot_arm/.venv) and server (work_root/.venv)
-VENV="${VENV:-$(dirname "$REPO_ROOT")/.venv}"
+# venv path differs between local (rebot_arm/.venv) and server. On the
+# server we now default to .venv_le05 (py3.12 + lerobot 0.5 + streaming
+# video encoding); the older .venv (lerobot 0.3) is kept as fallback for
+# evaluating Test #1 ckpts.
+DEFAULT_SERVER_VENV="$(dirname "$REPO_ROOT")/.venv_le05"
+[ -x "$DEFAULT_SERVER_VENV/bin/python3" ] || DEFAULT_SERVER_VENV="$(dirname "$REPO_ROOT")/.venv"
+VENV="${VENV:-$DEFAULT_SERVER_VENV}"
 if [ ! -x "$VENV/bin/python3" ]; then
     echo "ERROR: venv not found at $VENV/bin/python3"
     echo "Did you run scripts/sync_to_server.sh setup-remote?"
@@ -65,12 +70,15 @@ declare -A DP_RUNS=(
     [DP_A]="0 dual resnet34 48"
     [DP_B]="1 dual resnet18 64"
     [DP_C]="2 single resnet34 48"
-    [DP_D]="3 dual resnet34 96"     # bigger batch; image-size ablation TODO
+    [DP_D]="3 dual resnet34 32"     # was 96 → OOM(48GB), 64 → OOM(48GB); 32 fits
 )
 
 declare -A VLA_RUNS=(
-    # NAME             = "GPU  POLICY    BATCH  EXTRA_FLAGS"
-    [PI0FAST]="4 pi0fast 8 --use-lora"
+    # NAME       = "GPU  POLICY   BATCH  EXTRA_FLAGS"
+    # PI0FAST was dead at launch: lerobot/pi0fast-base on HF is a 0.3-era
+    # ckpt with no policy_preprocessor.json, which lerobot 0.5 requires.
+    # Replaced with PI05 (lerobot/pi05_base has all 0.5 files).
+    [PI05]="4 pi05 8"
     [SMOLVLA]="5 smolvla 16"
 )
 
@@ -175,7 +183,7 @@ for name in DP_A DP_B DP_C DP_D; do
     launch_one "$name" "$gpu_id" "$variant" "$backbone" "$batch"
 done
 
-for name in PI0FAST SMOLVLA; do
+for name in PI05 SMOLVLA; do
     if [ -n "$ONLY" ] && ! echo ",$ONLY," | grep -q ",$name,"; then
         continue
     fi

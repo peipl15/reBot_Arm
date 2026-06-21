@@ -42,7 +42,10 @@ from pathlib import Path
 # HF Hub IDs for the default pretrained checkpoints. We document them so the
 # next reader knows where the weights came from; override with --pretrained-path.
 DEFAULT_CKPT = {
-    "pi0fast": "lerobot/pi0fast_base",
+    # Note: HF repo names use hyphens and underscores inconsistently. These
+    # are the names that actually resolve as of 2026-06-21:
+    "pi0fast": "lerobot/pi0fast-base",   # 0.3-style ckpt, missing 0.5 preprocessor
+    "pi05":    "lerobot/pi05_base",      # 0.5-ready; has policy_preprocessor.json
     "smolvla": "lerobot/smolvla_base",
 }
 
@@ -52,7 +55,9 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset-root", required=True)
     p.add_argument("--repo-id", default=None)
-    p.add_argument("--policy", choices=["pi0fast", "smolvla"], required=True)
+    p.add_argument("--policy", choices=["pi0fast", "pi05", "smolvla"], required=True,
+                   help="pi0fast = lerobot 0.3/0.5; pi05 = lerobot 0.5 only; "
+                        "smolvla = lerobot 0.3+")
     p.add_argument("--pretrained-path", default=None,
                    help=f"HF id or local path. Defaults: {DEFAULT_CKPT}")
     p.add_argument("--task-prompt", default="pick up the black tape and put it in the silver box",
@@ -127,10 +132,23 @@ def main():
         from lerobot.configs.types import (
             PolicyFeature, FeatureType, NormalizationMode
         )
-        from lerobot.scripts.train import train
+        try:
+            from lerobot.scripts.lerobot_train import train
+        except ImportError:
+            from lerobot.scripts.train import train
         if args.policy == "pi0fast":
-            from lerobot.policies.pi0fast.configuration_pi0fast import (
-                PI0FASTConfig as PolicyCfg)
+            # lerobot 0.3 used pi0fast (no underscore), some 0.5 builds use
+            # pi0_fast. Try both.
+            try:
+                from lerobot.policies.pi0fast.configuration_pi0fast import (
+                    PI0FASTConfig as PolicyCfg)
+            except ImportError:
+                from lerobot.policies.pi0_fast.configuration_pi0_fast import (
+                    PI0FastConfig as PolicyCfg)
+        elif args.policy == "pi05":
+            # pi0.5 is only in lerobot 0.5+
+            from lerobot.policies.pi05.configuration_pi05 import (
+                PI05Config as PolicyCfg)
         else:
             from lerobot.policies.smolvla.configuration_smolvla import (
                 SmolVLAConfig as PolicyCfg)
@@ -184,10 +202,27 @@ def main():
         optimizer_lr=args.lr,
     )
     if args.policy == "pi0fast" and args.use_lora:
-        # PI0FASTConfig exposes lora_targets / freeze_vlm depending on lerobot
-        # version. Set both conservatively; unknown keys are ignored at config
-        # construction.
-        policy_kwargs.update(dict(freeze_vlm=True))
+        # lerobot 0.3: `freeze_vlm=True` is policy-level (just freezes the VLM).
+        # lerobot 0.5: `use_peft=True` flips the policy into PEFT mode, but
+        # that ALSO triggers `from_pretrained(adapter_config.json)` lookup
+        # on the pretrained_path — fails for vanilla `lerobot/pi0fast_base`
+        # because it isn't a PEFT-saved repo. Proper LoRA needs a peft block
+        # in TrainPipelineConfig and a pre-saved adapter. For now, run full
+        # fine-tune (slow but works).
+        import dataclasses as _dc
+        try:
+            from lerobot.policies.pi0_fast.configuration_pi0_fast import PI0FastConfig as _Cfg
+        except ImportError:
+            from lerobot.policies.pi0fast.configuration_pi0fast import PI0FASTConfig as _Cfg
+        names = {f.name for f in _dc.fields(_Cfg)}
+        if "freeze_vlm" in names:
+            # lerobot 0.3 path — safe to use.
+            policy_kwargs.update(dict(freeze_vlm=True))
+            print("[train_vla] pi0fast LoRA: freeze_vlm=True (lerobot 0.3)")
+        else:
+            print("[train_vla] pi0fast LoRA on lerobot 0.5 needs a peft "
+                  "block in TrainPipelineConfig — falling back to full "
+                  "fine-tune. (TODO: wire LoRA properly.)")
     policy_cfg = PolicyCfg(**policy_kwargs)
     print(f"[train_vla] policy={args.policy}  pretrained={pretrained_path}  "
           f"use_lora={args.use_lora}")

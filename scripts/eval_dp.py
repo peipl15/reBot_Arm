@@ -101,16 +101,109 @@ def parse_args():
                    help="order in which home_arm moves joints. Defaults to "
                         "j4 first because folding/unfolding j4 last can collide "
                         "with j2/j3 in some configurations.")
+    p.add_argument("--task-prompt", default="pick_tape",
+                   help="language prompt for VLA policies (SmolVLA / PI05). "
+                        "Should match what the policy was fine-tuned on.")
     return p.parse_args()
 
 
 def load_policy(ckpt_path: Path, device: str):
-    from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
-    print(f"Loading DiffusionPolicy from {ckpt_path}...")
-    policy = DiffusionPolicy.from_pretrained(str(ckpt_path))
+    """Load any LeRobot policy (DP / SmolVLA / PI0 / PI05 / PI0Fast) by
+    inspecting the ckpt's config.json. Returns (policy, preproc, postproc).
+
+    lerobot 0.5 standardised the pipeline: ALL policy types (DP included)
+    factor out normalization into separate `policy_preprocessor.json` /
+    `policy_postprocessor.json` files. The preproc normalizes state +
+    images (and for VLAs also tokenizes the task string); the postproc
+    UN-normalizes the action chunk back to physical joint space. Without
+    postproc, select_action returns a value in [-1, 1] MIN_MAX space which
+    looks like a small rad target on some joints (j2/j3 near home) but a
+    far one on others (j1 with wide range) → asymmetric drift, exactly
+    what we saw on first eval.
+
+    For lerobot 0.3 ckpts (DP only) those files don't exist; we return
+    None for preproc/postproc and the main loop skips them."""
+    import json
+    cfg = json.load(open(ckpt_path / "config.json"))
+    ptype = cfg.get("type", "diffusion")
+    print(f"Loading {ptype} from {ckpt_path}...")
+
+    if ptype == "diffusion":
+        from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
+        policy = DiffusionPolicy.from_pretrained(str(ckpt_path))
+        preproc = postproc = None
+        # Fall through to the unified normalizer-detection block below.
+    else:
+        # VLA models need a PolicyPreprocessor (tokenizes task string into
+        # observation.language.tokens, normalizes images, etc.).
+        # IMPORTANT: import the policy module FIRST so the @ProcessorStepRegistry
+        # decorators run and register the smolvla/pi0/pi05-specific processor
+        # steps. Otherwise DataProcessorPipeline.from_pretrained throws
+        # KeyError on the step name.
+        if ptype == "smolvla":
+            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+            from lerobot.policies.smolvla import processor_smolvla  # registers steps
+        elif ptype in ("pi0", "pi05"):
+            from importlib import import_module
+            mod = "pi0" if ptype == "pi0" else "pi05"
+            import_module(f"lerobot.policies.{mod}.modeling_{mod}")
+            try:
+                import_module(f"lerobot.policies.{mod}.processor_{mod}")
+            except ImportError:
+                pass
+        elif ptype in ("pi0fast", "pi0_fast"):
+            try:
+                from lerobot.policies.pi0_fast import modeling_pi0_fast as _
+                try:
+                    from lerobot.policies.pi0_fast import processor_pi0_fast as _
+                except ImportError:
+                    pass
+            except ImportError:
+                from lerobot.policies.pi0fast import modeling_pi0fast as _
+        from lerobot.processor import DataProcessorPipeline
+        preproc = DataProcessorPipeline.from_pretrained(
+            str(ckpt_path), config_filename="policy_preprocessor.json"
+        )
+        postproc = DataProcessorPipeline.from_pretrained(
+            str(ckpt_path), config_filename="policy_postprocessor.json"
+        )
+        if ptype == "smolvla":
+            policy = SmolVLAPolicy.from_pretrained(str(ckpt_path))
+        elif ptype in ("pi0", "pi05"):
+            mod_name = "pi0" if ptype == "pi0" else "pi05"
+            from importlib import import_module
+            m = import_module(f"lerobot.policies.{mod_name}.modeling_{mod_name}")
+            cls = getattr(m, "PI0Policy" if ptype == "pi0" else "PI05Policy")
+            policy = cls.from_pretrained(str(ckpt_path))
+        elif ptype in ("pi0fast", "pi0_fast"):
+            try:
+                from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy as cls
+            except ImportError:
+                from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy as cls
+            policy = cls.from_pretrained(str(ckpt_path))
+        else:
+            raise ValueError(f"unknown policy type {ptype!r} in {ckpt_path}/config.json")
+    # lerobot 0.5 ckpts ALWAYS have policy_preprocessor.json / policy_postprocessor.json,
+    # even for DP. If preproc/postproc weren't set in the type-specific branch
+    # above (DP path), load them now if the files are present.
+    pp_pre = ckpt_path / "policy_preprocessor.json"
+    pp_post = ckpt_path / "policy_postprocessor.json"
+    if preproc is None and pp_pre.exists():
+        from lerobot.processor import DataProcessorPipeline
+        preproc = DataProcessorPipeline.from_pretrained(
+            str(ckpt_path), config_filename="policy_preprocessor.json"
+        )
+        print(f"  loaded preproc from {pp_pre.name} (lerobot 0.5 ckpt)")
+    if postproc is None and pp_post.exists():
+        from lerobot.processor import DataProcessorPipeline
+        postproc = DataProcessorPipeline.from_pretrained(
+            str(ckpt_path), config_filename="policy_postprocessor.json"
+        )
+        print(f"  loaded postproc from {pp_post.name}")
+
     policy.to(device)
     policy.eval()
-    return policy
+    return policy, preproc, postproc
 
 
 def prep_image_for_policy(bgr_frame: np.ndarray, target_h: int, target_w: int,
@@ -196,7 +289,13 @@ def main():
         sys.exit(1)
 
     # 1) Policy
-    policy = load_policy(Path(args.ckpt), args.device)
+    policy, preproc, postproc = load_policy(Path(args.ckpt), args.device)
+    if preproc is not None:
+        # VLA preprocessor needs a task string per sample. Use the dataset
+        # task name (we recorded with "pick_tape"; this is the same prompt
+        # the policy saw during fine-tuning).
+        print(f"  preproc loaded; task prompt = {args.task_prompt!r}")
+        print(f"  postproc loaded ({type(postproc).__name__}) — will unnormalize action")
 
     # The policy's input feature shapes are baked into the checkpoint; we
     # match the resolution we feed it to the dataset that produced the ckpt.
@@ -303,9 +402,21 @@ def main():
                     wrist_t = prep_image_for_policy(rs_rgb, img_h, img_w, args.device)
                     obs["observation.images.wrist"] = wrist_t
 
+                # VLA preprocessor: needs "task" key + may run tokenizer
+                if preproc is not None:
+                    obs["task"] = [args.task_prompt]
+                    obs = preproc(obs)
+
                 # Inference
                 with torch.inference_mode():
                     action_tensor = policy.select_action(obs)
+
+                # VLA returns NORMALIZED action; postproc unnormalizes back to
+                # physical joint angles. Without this, j1 etc. wander far.
+                if postproc is not None:
+                    out = postproc({"action": action_tensor})
+                    action_tensor = out["action"] if isinstance(out, dict) else out
+
                 action = action_tensor.squeeze(0).cpu().numpy().tolist()
                 last_action = action
 

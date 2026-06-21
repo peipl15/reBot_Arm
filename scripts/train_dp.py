@@ -98,7 +98,12 @@ def main():
             PolicyFeature, FeatureType, NormalizationMode
         )
         from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-        from lerobot.scripts.train import train
+        # lerobot 0.5 moved train() from lerobot.scripts.train to
+        # lerobot.scripts.lerobot_train. Try 0.5 path first, fall back to 0.3.
+        try:
+            from lerobot.scripts.lerobot_train import train
+        except ImportError:
+            from lerobot.scripts.train import train
         from lerobot.datasets import video_utils as _vu
     except ImportError as e:
         print(f"ERROR: required imports missing ({e})")
@@ -153,9 +158,13 @@ def main():
                 container.close()
 
         _vu.decode_video_frames = _decode_pyav
-        # Also patch the binding imported into lerobot_dataset.py
+        # lerobot 0.3 also imports decode_video_frames into lerobot_dataset
+        # at module load, so we need to patch that binding too. 0.5 no
+        # longer does, but the attribute may exist as a leftover — set
+        # defensively if present.
         from lerobot.datasets import lerobot_dataset as _ds_mod
-        _ds_mod.decode_video_frames = _decode_pyav
+        if hasattr(_ds_mod, "decode_video_frames"):
+            _ds_mod.decode_video_frames = _decode_pyav
         print("[train_dp] patched decode_video_frames to PyAV "
               "(workaround for torchcodec OOM)")
 
@@ -174,7 +183,15 @@ def main():
     # Build input_features dict. Always include state + third_person.
     # Add wrist only for the dual variant.
     state_shape = tuple(feats["observation.state"]["shape"])
-    third_shape = tuple(feats["observation.images.third_person"]["shape"])
+    # info.json stores image shape as (H, W, C). lerobot 0.5's
+    # DiffusionConfig.validate_features expects PolicyFeature shape in
+    # (C, H, W) order. 0.3 was permissive about this; 0.5 enforces it.
+    # We detect by checking trailing dim == 3 and transpose.
+    third_shape_raw = tuple(feats["observation.images.third_person"]["shape"])
+    if len(third_shape_raw) == 3 and third_shape_raw[-1] == 3:
+        third_shape = (third_shape_raw[2], third_shape_raw[0], third_shape_raw[1])
+    else:
+        third_shape = third_shape_raw
     action_shape = tuple(feats["action"]["shape"])
 
     input_features = {
@@ -186,7 +203,11 @@ def main():
         if "observation.images.wrist" not in feats:
             print("ERROR: --variant dual but dataset has no observation.images.wrist")
             sys.exit(1)
-        wrist_shape = tuple(feats["observation.images.wrist"]["shape"])
+        wrist_shape_raw = tuple(feats["observation.images.wrist"]["shape"])
+        if len(wrist_shape_raw) == 3 and wrist_shape_raw[-1] == 3:
+            wrist_shape = (wrist_shape_raw[2], wrist_shape_raw[0], wrist_shape_raw[1])
+        else:
+            wrist_shape = wrist_shape_raw
         input_features["observation.images.wrist"] = PolicyFeature(
             type=FeatureType.VISUAL, shape=wrist_shape)
 
@@ -204,16 +225,22 @@ def main():
     print(f"  input_features:  {list(input_features.keys())}")
     print(f"  output_features: {list(output_features.keys())}")
 
-    # H1: no-crop uses the raw image; we disable random crop entirely by
-    # asking for crop_shape = full input shape. LeRobot 0.3 doesn't accept
-    # crop_shape=None, so we pass the image H/W from the dataset features.
+    # H1: no-crop uses the raw image. lerobot 0.3 didn't accept None and
+    # would happily take crop_shape=image_shape. 0.5's validate_features
+    # rejects crop_shape >= image_shape (strict <), so for 0.5 we have to
+    # subtract 1 pixel. Also third_shape may be HWC or CHW (we transposed
+    # to CHW above when needed), so derive H/W from whichever is positional.
+    if len(third_shape) == 3 and third_shape[0] == 3:
+        img_h, img_w = third_shape[1], third_shape[2]  # CHW
+    else:
+        img_h, img_w = third_shape[0], third_shape[1]  # HWC
     if args.no_crop:
-        img_h = third_shape[0]
-        img_w = third_shape[1]
-        crop_shape = (img_h, img_w)
+        # Pass slightly-smaller crop so 0.5's strict check passes; in 0.3 this
+        # is functionally identical. crop_is_random=False -> center crop only.
+        crop_shape = (img_h - 1, img_w - 1)
         crop_is_random = False
-        print(f"[train_dp] H1: crop_shape disabled — using full input "
-              f"{img_h}x{img_w}.")
+        print(f"[train_dp] H1: crop_shape ≈ full input ({img_h-1}x{img_w-1} "
+              f"vs image {img_h}x{img_w}; lerobot 0.5 requires strict <).")
     else:
         crop_shape = (args.crop_h, args.crop_w)
         crop_is_random = True
@@ -280,6 +307,8 @@ def main():
         total_eps = info["total_episodes"]
         if "," in args.val_episodes:
             val_ids = [int(x) for x in args.val_episodes.split(",")]
+        elif Path(args.val_episodes).exists():
+            val_ids = [int(l.strip()) for l in Path(args.val_episodes).read_text().splitlines() if l.strip()]
         else:
             frac = float(args.val_episodes)
             assert 0 < frac < 1, f"--val-episodes fraction must be in (0,1), got {frac}"
