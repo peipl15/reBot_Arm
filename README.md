@@ -7,7 +7,13 @@ adapter via `dm-device` transport.
 ## Hardware
 
 ### Follower (the arm we control)
-- 7x Damiao DM-J4340 motors, IDs `0x01..0x07`, feedback IDs `0x11..0x17`
+- 7 Damiao DM motors, IDs `0x01..0x07`, feedback IDs `0x11..0x17` — two models:
+  - **j1–j3** (base, shoulder, elbow): **DM-J4340** — T_MAX 28 Nm, V_MAX 10 rad/s
+  - **j4–j7** (wrist_flex, wrist_yaw, wrist_roll, gripper): **DM-J4310** — T_MAX 10 Nm, V_MAX 30 rad/s
+  - The per-joint `model` in `configs/joint_config.yaml` MUST match the real model
+    (4340 vs 4310): motorbridge decodes torque/velocity feedback against the
+    model's T_MAX/V_MAX. Tagging a J4310 as "4340" inflates its torque readings
+    2.8× (28/10) and mis-scales velocity — POS_VEL command speed is unaffected.
 - DaMiao DM-USB2FDCAN adapter (single-channel CAN-FD, motor bus at 5 Mbps data phase)
 - Mounted as the reBot Arm B601 DM follower (Seeed-Projects / kit-miao)
 

@@ -101,7 +101,8 @@ joints:
     id: 0x04
     feedback_id: 0x14
     name: wrist_flex
-    model: "4340"
+    model: "4310"   # DM4310 (wrist motor) — NOT 4340. Sets torque/vel feedback
+                    # decode scale (T_MAX=10). POS_VEL command speed is unaffected.
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
@@ -115,7 +116,7 @@ joints:
     id: 0x05
     feedback_id: 0x15
     name: wrist_yaw
-    model: "4340"
+    model: "4310"   # DM4310 — see j4 note
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
@@ -129,7 +130,7 @@ joints:
     id: 0x06
     feedback_id: 0x16
     name: wrist_roll
-    model: "4340"
+    model: "4310"   # DM4310 — see j4 note
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
@@ -147,7 +148,7 @@ joints:
     id: 0x07
     feedback_id: 0x17
     name: gripper
-    model: "4340"
+    model: "4310"   # DM4310 — see j4 note
     sign: +1
     pmax_fw: 12.5
     vmax_fw: 30.0
