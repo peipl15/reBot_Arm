@@ -77,9 +77,105 @@ def parse_args():
     p.add_argument("--use-lora", action="store_true",
                    help="pi0fast only — LoRA adapters instead of full fine-tune. "
                         "Sets pi0fast.lora_*=True via config kwargs.")
+    p.add_argument("--lora", action="store_true",
+                   help="Enable LoRA training via TrainPipelineConfig.peft. "
+                        "Required for pi05 on a single A40 (full fine-tune OOMs).")
+    p.add_argument("--dtype", default=None,
+                   choices=[None, "float32", "bfloat16"],
+                   help="Override the policy config dtype. PI05Config "
+                        "defaults to float32. Pass 'bfloat16' to enable "
+                        "mixed-precision: bf16 forward/backward + fp32 "
+                        "master weights + fp32 optimizer state. ~2× less "
+                        "VRAM than pure fp32.")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="Trade compute for VRAM: recompute activations "
+                        "during backward instead of caching. Cuts "
+                        "activation memory ~3-5×. Required for full pi05 "
+                        "fine-tune on single A40.")
+    p.add_argument("--lora-r", type=int, default=16,
+                   help="LoRA rank.")
+    p.add_argument("--lora-target-modules", default="q_proj,k_proj,v_proj,o_proj",
+                   help="comma-separated module name suffixes to wrap with LoRA.")
     p.add_argument("--val-episodes", default=None,
                    help="see train_dp.py — same semantics, same file format")
     return p.parse_args()
+
+
+def patch_pi05_embed_image_for_new_transformers():
+    """transformers ≥ 4.55 made `PaliGemmaModel.get_image_features` return a
+    raw Tensor instead of a `BaseModelOutputWithPooling`, so pi05's
+    `embed_image` (which reads `image_outputs.pooler_output`) crashes with
+    `'Tensor' object has no attribute 'pooler_output'` on transformers
+    4.57.6. lerobot 0.5.1's pi05 hasn't been updated for this yet.
+
+    Workaround: replace `embed_image` to call `vision_tower` directly,
+    which still returns the old object with `.pooler_output`.
+
+    Idempotent."""
+    try:
+        from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel
+    except ImportError:
+        return
+    if getattr(PaliGemmaWithExpertModel.embed_image, "_pi05_patched", False):
+        return
+    import torch as _t
+
+    def _patched(self, image):
+        out_dtype = image.dtype
+        if image.dtype != _t.float32:
+            image = image.to(_t.float32)
+        # paligemma.model is the inner PaliGemmaModel; we go straight to
+        # vision_tower + multi_modal_projector, the path the model wants.
+        # `image_outputs` is BaseModelOutputWithPooling but transformers
+        # 4.57's SigLIP returns `pooler_output=None` because the
+        # MultiHeadAttentionPoolingHead is disabled. We:
+        #   (1) take last_hidden_state -> (B, P, H_vis)
+        #   (2) apply the multi_modal_projector -> (B, P, H_text)
+        #   (3) divide by sqrt(H_text) per the new PaliGemma convention,
+        #       then multiply by H_text**0.5 per the old pi05 convention,
+        #       which cancels — so the projected features are returned as-is.
+        # This matches what `get_image_features` does in modern transformers
+        # except we return Tensor of shape (B, P, H_text) rather than the
+        # original pi05's (B, H_text) pooled vector.
+        # pi05's downstream code already expects per-patch features
+        # in the prefix_embs concatenation, so this shape is correct.
+        vision = self.paligemma.model.vision_tower(image)
+        feats = vision.last_hidden_state                       # (B, P, H_vis)
+        feats = self.paligemma.model.multi_modal_projector(feats)  # (B, P, H_text)
+        if feats.dtype != out_dtype:
+            feats = feats.to(out_dtype)
+        return feats
+
+    _patched._pi05_patched = True  # type: ignore[attr-defined]
+    PaliGemmaWithExpertModel.embed_image = _patched
+    print("[train_vla] pi05 embed_image patched for transformers ≥ 4.55 API")
+
+
+def patch_processor_registry_aliases():
+    """Add registry-name aliases for processor steps that pi0.5 / future
+    VLA ckpts reference but our installed lerobot doesn't expose under
+    that name.
+
+    Concrete case (2026-06-21): `lerobot/pi05_base`'s
+    `policy_preprocessor.json` references `relative_actions_processor`,
+    but lerobot 0.5.1 only registered the SAME class
+    (`RelativeActionsProcessorStep`) under the name
+    `delta_actions_processor`. A one-line alias is enough — the step is
+    `enabled: false` in the ckpt config anyway, so it's just a registry
+    lookup, no runtime semantics.
+    """
+    from lerobot.processor import ProcessorStepRegistry
+    reg = ProcessorStepRegistry._registry
+    aliases = {
+        "relative_actions_processor": "delta_actions_processor",
+    }
+    for new_name, existing_name in aliases.items():
+        if new_name in reg or existing_name not in reg:
+            continue
+        cls = reg[existing_name]
+        ProcessorStepRegistry.register(new_name)(cls)
+        print(f"[train_vla] registry alias: {new_name} → {existing_name} "
+              f"({cls.__name__})")
 
 
 def patch_video_backend():
@@ -160,6 +256,11 @@ def main():
         patch_video_backend()
         print("[train_vla] PyAV video patch applied")
 
+    # Must run BEFORE PolicyCfg import or any DataProcessorPipeline.from_pretrained.
+    patch_processor_registry_aliases()
+    if args.policy == "pi05":
+        patch_pi05_embed_image_for_new_transformers()
+
     dataset_root = Path(args.dataset_root).resolve()
     info = json.loads((dataset_root / "meta" / "info.json").read_text())
     feats = info["features"]
@@ -201,6 +302,12 @@ def main():
         pretrained_path=pretrained_path,
         optimizer_lr=args.lr,
     )
+    if args.dtype is not None:
+        policy_kwargs["dtype"] = args.dtype
+        print(f"[train_vla] policy dtype override: {args.dtype}")
+    if args.gradient_checkpointing:
+        policy_kwargs["gradient_checkpointing"] = True
+        print("[train_vla] gradient_checkpointing=True")
     if args.policy == "pi0fast" and args.use_lora:
         # lerobot 0.3: `freeze_vlm=True` is policy-level (just freezes the VLM).
         # lerobot 0.5: `use_peft=True` flips the policy into PEFT mode, but
@@ -239,7 +346,7 @@ def main():
     )
     output_dir = output_dir.resolve()
 
-    train_cfg = TrainPipelineConfig(
+    train_cfg_kwargs = dict(
         dataset=dataset_cfg,
         policy=policy_cfg,
         output_dir=output_dir,
@@ -254,6 +361,17 @@ def main():
         save_freq=args.save_freq,
         use_policy_training_preset=True,
     )
+    if args.lora:
+        from lerobot.configs.default import PeftConfig
+        peft_cfg = PeftConfig(
+            method_type="LORA",
+            r=args.lora_r,
+            target_modules=args.lora_target_modules.split(","),
+        )
+        train_cfg_kwargs["peft"] = peft_cfg
+        print(f"[train_vla] LoRA enabled: r={args.lora_r}  "
+              f"targets={args.lora_target_modules}")
+    train_cfg = TrainPipelineConfig(**train_cfg_kwargs)
 
     if args.val_episodes is not None:
         total_eps = info["total_episodes"]

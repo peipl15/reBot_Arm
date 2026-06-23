@@ -109,34 +109,102 @@ def main():
     # only if the user actually evaluates a VLA ckpt.
     def _load_policy(model_dir, device):
         import json as _json
+        from pathlib import Path as _P
         cfg = _json.load(open(f"{model_dir}/config.json"))
         ptype = cfg.get("type", "diffusion")
         if ptype == "diffusion":
             return DiffusionPolicy.from_pretrained(str(model_dir)).to(device), None
-        # For VLA policies the dataset batch must be pre-processed by the
-        # PolicyPreprocessor that was saved alongside the ckpt — adds
-        # `observation.language.tokens`, normalizes images, etc.
+
+        # Compat shims for VLA paths (same as eval_dp.py).
+        from lerobot.processor import ProcessorStepRegistry
+        _reg = ProcessorStepRegistry._registry
+        if ("relative_actions_processor" not in _reg
+                and "delta_actions_processor" in _reg):
+            ProcessorStepRegistry.register("relative_actions_processor")(
+                _reg["delta_actions_processor"])
+        if ptype == "pi05":
+            # transformers 4.55+ SigLIP returns pooler_output=None; pi05's
+            # original embed_image breaks. Patch to use last_hidden_state.
+            from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel
+            if not getattr(PaliGemmaWithExpertModel.embed_image,
+                           "_pi05_patched", False):
+                import torch as _t
+                def _patched(self, image):
+                    out_dtype = image.dtype
+                    if image.dtype != _t.float32:
+                        image = image.to(_t.float32)
+                    vision = self.paligemma.model.vision_tower(image)
+                    feats = vision.last_hidden_state
+                    feats = self.paligemma.model.multi_modal_projector(feats)
+                    if feats.dtype != out_dtype:
+                        feats = feats.to(out_dtype)
+                    return feats
+                _patched._pi05_patched = True
+                PaliGemmaWithExpertModel.embed_image = _patched
+
         from lerobot.processor import DataProcessorPipeline
         preproc = DataProcessorPipeline.from_pretrained(
             str(model_dir), config_filename="policy_preprocessor.json"
         )
+
+        # LoRA detection: a saved adapter has `adapter_config.json` +
+        # `adapter_model.safetensors` instead of a `model.safetensors`.
+        # We then load the base HF model + wrap_with_peft pointing at our
+        # adapter dir.
+        is_lora = (_P(model_dir) / "adapter_config.json").exists()
+
         if ptype == "smolvla":
-            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-            policy = SmolVLAPolicy.from_pretrained(str(model_dir)).to(device)
+            from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy as PCls
+            base_repo = "lerobot/smolvla_base"
         elif ptype in ("pi0", "pi05"):
             mod = "pi0" if ptype == "pi0" else "pi05"
             from importlib import import_module
             m = import_module(f"lerobot.policies.{mod}.modeling_{mod}")
-            cls = getattr(m, "PI0Policy" if ptype == "pi0" else "PI05Policy")
-            policy = cls.from_pretrained(str(model_dir)).to(device)
+            PCls = getattr(m, "PI0Policy" if ptype == "pi0" else "PI05Policy")
+            base_repo = "lerobot/pi0_base" if ptype == "pi0" else "lerobot/pi05_base"
         elif ptype in ("pi0fast", "pi0_fast"):
             try:
-                from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy as cls
+                from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy as PCls
             except ImportError:
-                from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy as cls
-            policy = cls.from_pretrained(str(model_dir)).to(device)
+                from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy as PCls
+            base_repo = "lerobot/pi0fast-base"
         else:
             raise ValueError(f"unknown policy type {ptype!r} in {model_dir}/config.json")
+
+        if is_lora:
+            print(f"  detected LoRA ckpt at {model_dir}; loading base {base_repo}")
+            policy = PCls.from_pretrained(base_repo).to(device)
+            # PreTrainedPolicy.wrap_with_peft creates a fresh adapter from a
+            # PeftConfig — it doesn't load a saved adapter. To load a saved
+            # adapter we use PEFT's own API.
+            from peft import PeftModel
+            policy = PeftModel.from_pretrained(policy, str(model_dir))
+            policy = policy.to(device)
+            # The base ckpt's config has input_features named after the
+            # original pi05 training data (`base_0_rgb`, etc.). Our adapter
+            # was actually trained against `third_person` / `wrist` so the
+            # config on disk in OUR ckpt has the right names. Pull those
+            # back onto policy.config so the dataset reader queries the
+            # correct columns.
+            from lerobot.configs.policies import PreTrainedConfig
+            local_cfg = PreTrainedConfig.from_pretrained(str(model_dir))
+            # Update config on EVERY accessible policy reference. PeftModel
+            # wraps base_model.model and may or may not forward .config; we
+            # patch both paths so policy.config and policy.base_model.config
+            # and policy.base_model.model.config all reflect our trained
+            # ckpt's actual feature names.
+            for obj in (policy,
+                        getattr(policy, "base_model", None),
+                        getattr(getattr(policy, "base_model", None), "model", None)):
+                if obj is None or not hasattr(obj, "config"):
+                    continue
+                try:
+                    obj.config.input_features = local_cfg.input_features
+                    obj.config.output_features = local_cfg.output_features
+                except (AttributeError, TypeError):
+                    pass
+        else:
+            policy = PCls.from_pretrained(str(model_dir)).to(device)
         return policy, preproc
 
     patch_pyav()
@@ -192,13 +260,16 @@ def main():
             policy.eval()
 
             # Build delta_timestamps the same way training did.
-            # DiffusionConfig exposes only observation_delta_indices and
-            # action_delta_indices (e.g. [-1,0] and [-1,0,1,...,14]).
-            # We map them to seconds and apply per-feature.
+            # Resolve LeRobot policy config. PeftModel wraps policy and its
+            # own .config is a PeftConfig, not our PI05Config — walk inner.
             policy_cfg = policy.config
+            if not hasattr(policy_cfg, "input_features"):
+                inner = getattr(policy, "base_model", None) or policy
+                inner_model = getattr(inner, "model", inner)
+                policy_cfg = inner_model.config
             input_feats = list(policy_cfg.input_features.keys())
-            print(f"  input_features: {input_feats}")
-
+            print(f"  resolved policy_cfg={type(policy_cfg).__name__}  "
+                  f"input_features={input_feats}")
             fps = info["fps"]
             # SmolVLA / pi0 / pi05 don't store observation_delta_indices or
             # action_delta_indices on the config — they use n_obs_steps +

@@ -72,7 +72,8 @@ def parse_args():
                    help="lerobot policy type — currently we only test diffusion")
     p.add_argument("--device", default="cuda",
                    help="torch device for inference (cuda / cpu)")
-    p.add_argument("--c922-index", type=int, default=8)
+    p.add_argument("--c922-index", type=int, default=-1,
+                   help="/dev/videoN index; -1 = auto-find C922 by device name")
     p.add_argument("--c922-width", type=int, default=640)
     p.add_argument("--c922-height", type=int, default=480)
     p.add_argument("--rs-width", type=int, default=640)
@@ -140,6 +141,18 @@ def load_policy(ckpt_path: Path, device: str):
         # decorators run and register the smolvla/pi0/pi05-specific processor
         # steps. Otherwise DataProcessorPipeline.from_pretrained throws
         # KeyError on the step name.
+        # Also: alias `relative_actions_processor` → `delta_actions_processor`
+        # so pi05 ckpts (which reference the former name) load on lerobot
+        # 0.5.1 (which only registers the same class under the latter name).
+        try:
+            from lerobot.processor import ProcessorStepRegistry
+            _reg = ProcessorStepRegistry._registry
+            if ("relative_actions_processor" not in _reg
+                    and "delta_actions_processor" in _reg):
+                ProcessorStepRegistry.register("relative_actions_processor")(
+                    _reg["delta_actions_processor"])
+        except Exception:
+            pass
         if ptype == "smolvla":
             from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
             from lerobot.policies.smolvla import processor_smolvla  # registers steps
@@ -151,6 +164,35 @@ def load_policy(ckpt_path: Path, device: str):
                 import_module(f"lerobot.policies.{mod}.processor_{mod}")
             except ImportError:
                 pass
+            # pi05 patch for transformers 4.55+ SigLIP API change.
+            if ptype == "pi05":
+                from lerobot.policies.pi05.modeling_pi05 import PaliGemmaWithExpertModel
+                if not getattr(PaliGemmaWithExpertModel.embed_image,
+                               "_pi05_patched", False):
+                    import torch as _torch
+                    def _patched_embed(self, image):
+                        out_dtype = image.dtype
+                        if image.dtype != _torch.float32:
+                            image = image.to(_torch.float32)
+                        vision = self.paligemma.model.vision_tower(image)
+                        feats = vision.last_hidden_state
+                        feats = self.paligemma.model.multi_modal_projector(feats)
+                        if feats.dtype != out_dtype:
+                            feats = feats.to(out_dtype)
+                        return feats
+                    _patched_embed._pi05_patched = True
+                    PaliGemmaWithExpertModel.embed_image = _patched_embed
+                # transformers 4.55+ renamed create_causal_mask's `inputs_embeds`
+                # kwarg to `input_embeds`. Wrap to accept both.
+                import lerobot.policies.pi_gemma as _pi_gemma_mod
+                _orig_create_causal = _pi_gemma_mod.create_causal_mask
+                if not getattr(_orig_create_causal, "_pi05_patched", False):
+                    def _shimmed_create_causal_mask(*args, **kwargs):
+                        if "inputs_embeds" in kwargs and "input_embeds" not in kwargs:
+                            kwargs["input_embeds"] = kwargs.pop("inputs_embeds")
+                        return _orig_create_causal(*args, **kwargs)
+                    _shimmed_create_causal_mask._pi05_patched = True
+                    _pi_gemma_mod.create_causal_mask = _shimmed_create_causal_mask
         elif ptype in ("pi0fast", "pi0_fast"):
             try:
                 from lerobot.policies.pi0_fast import modeling_pi0_fast as _
@@ -167,22 +209,70 @@ def load_policy(ckpt_path: Path, device: str):
         postproc = DataProcessorPipeline.from_pretrained(
             str(ckpt_path), config_filename="policy_postprocessor.json"
         )
+        # LoRA detection: adapter_config.json present → ckpt is just the
+        # adapter (~36MB safetensors), need to load base HF model first
+        # and then wrap with PEFT.
+        is_lora = (ckpt_path / "adapter_config.json").exists()
         if ptype == "smolvla":
-            policy = SmolVLAPolicy.from_pretrained(str(ckpt_path))
+            base_repo = "lerobot/smolvla_base"
+            PCls = SmolVLAPolicy
         elif ptype in ("pi0", "pi05"):
             mod_name = "pi0" if ptype == "pi0" else "pi05"
             from importlib import import_module
             m = import_module(f"lerobot.policies.{mod_name}.modeling_{mod_name}")
-            cls = getattr(m, "PI0Policy" if ptype == "pi0" else "PI05Policy")
-            policy = cls.from_pretrained(str(ckpt_path))
+            PCls = getattr(m, "PI0Policy" if ptype == "pi0" else "PI05Policy")
+            base_repo = "lerobot/pi0_base" if ptype == "pi0" else "lerobot/pi05_base"
         elif ptype in ("pi0fast", "pi0_fast"):
             try:
-                from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy as cls
+                from lerobot.policies.pi0_fast.modeling_pi0_fast import PI0FastPolicy as PCls
             except ImportError:
-                from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy as cls
-            policy = cls.from_pretrained(str(ckpt_path))
+                from lerobot.policies.pi0fast.modeling_pi0fast import PI0FASTPolicy as PCls
+            base_repo = "lerobot/pi0fast-base"
         else:
             raise ValueError(f"unknown policy type {ptype!r} in {ckpt_path}/config.json")
+
+        if is_lora:
+            print(f"  LoRA ckpt detected — loading base {base_repo} + adapter")
+            # pi05 fp32 ~12 GB OOMs the local 12 GB RTX 3500 Ada. PI05Config
+            # has a `dtype` field that accepts "bfloat16"; load base config,
+            # mutate dtype, then load policy with that config. A40 has 48 GB
+            # so this branch only triggers on small GPUs.
+            import torch as _torch
+            if (ptype == "pi05" and _torch.cuda.is_available()
+                    and _torch.cuda.mem_get_info()[1] < 24 * 1024**3):
+                from lerobot.configs.policies import PreTrainedConfig
+                base_cfg = PreTrainedConfig.from_pretrained(base_repo)
+                base_cfg.dtype = "bfloat16"
+                print(f"  GPU only {_torch.cuda.mem_get_info()[1]/1024**3:.1f} GB; "
+                      f"loading pi05 in bf16 via PI05Config.dtype")
+                policy = PCls.from_pretrained(base_repo, config=base_cfg)
+            else:
+                policy = PCls.from_pretrained(base_repo)
+            # PreTrainedPolicy.wrap_with_peft only builds a fresh adapter
+            # from a PeftConfig — it doesn't load saved weights. To load
+            # a saved adapter we use PEFT's own API.
+            from peft import PeftModel
+            policy = PeftModel.from_pretrained(policy, str(ckpt_path))
+            # The base ckpt's `input_features` references pi05's original
+            # training data names (base_0_rgb, left_wrist_0_rgb, ...).
+            # Our trained ckpt's config.json has the actual feature names
+            # (observation.images.third_person / wrist) — overwrite the
+            # loaded policy's config with those so select_action /
+            # _preprocess_images sees the right keys.
+            from lerobot.configs.policies import PreTrainedConfig
+            local_cfg = PreTrainedConfig.from_pretrained(str(ckpt_path))
+            for obj in (policy,
+                        getattr(policy, "base_model", None),
+                        getattr(getattr(policy, "base_model", None), "model", None)):
+                if obj is None or not hasattr(obj, "config"):
+                    continue
+                try:
+                    obj.config.input_features = local_cfg.input_features
+                    obj.config.output_features = local_cfg.output_features
+                except (AttributeError, TypeError):
+                    pass
+        else:
+            policy = PCls.from_pretrained(str(ckpt_path))
     # lerobot 0.5 ckpts ALWAYS have policy_preprocessor.json / policy_postprocessor.json,
     # even for DP. If preproc/postproc weren't set in the type-specific branch
     # above (DP path), load them now if the files are present.
@@ -303,6 +393,13 @@ def main():
     img_h, img_w = args.c922_height, args.c922_width
 
     # 2) Cameras
+    if args.c922_index < 0:
+        from camera_utils import find_camera_index
+        idx = find_camera_index("C922")
+        if idx is None:
+            raise RuntimeError("C922 not found by name (is it plugged in?)")
+        args.c922_index = idx
+        print(f"Auto-detected C922 at /dev/video{idx}")
     print(f"\nOpening C922 on /dev/video{args.c922_index}...")
     cap = cv2.VideoCapture(args.c922_index)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))

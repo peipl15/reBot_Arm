@@ -1,0 +1,48 @@
+# accelerate FSDP config for pi0.5 full bf16 fine-tune across 4 A40 cards.
+# Use with:
+#   accelerate launch --config_file deploy/accelerate_fsdp_4gpu.yaml \
+#       scripts/train_vla.py --policy pi05 --dtype bfloat16 ...
+#
+# Cards 4-7 are the empty ones on jiagpu8_yz right now. Other config files
+# can change num_processes / gpu_ids if availability shifts.
+compute_environment: LOCAL_MACHINE
+distributed_type: FSDP
+# `mixed_precision: bf16` triggers FSDP's MixedPrecision wrapper which then
+# expects uniform param dtype inside each shard. pi05's `params_to_keep_float32`
+# design keeps some critical layers fp32 (norms, embeddings) — FSDP rejects
+# the mix. Two options:
+#   (a) mixed_precision: no  + PI05Config dtype="float32" — pure fp32. Largest
+#       VRAM, but pi05 base is < 14 GB / shard across 4 cards = 3.5 GB params each.
+#   (b) mixed_precision: no  + PI05Config dtype="bfloat16" + override
+#       params_to_keep_float32 to be empty — full bf16. Smaller but loses
+#       the numerical protection on norm layers (loss may diverge).
+# We go with (a) — pure fp32 FSDP. With 4 A40 (48 GB each) total 192 GB we
+# have plenty of room for fp32 params + grads + Adam opt state, all sharded.
+mixed_precision: 'no'
+num_processes: 4
+num_machines: 1
+machine_rank: 0
+main_training_function: main
+rdzv_backend: static
+same_network: true
+fsdp_config:
+  # SHARDED_STATE_DICT: each rank only writes its shard at save time, then
+  # we'd manually merge. FULL_STATE_DICT lets us load with PeftModel /
+  # eval_dp.py without merging — required since our downstream tools
+  # expect a single-rank ckpt.
+  fsdp_state_dict_type: FULL_STATE_DICT
+  # FULL_SHARD = ZeRO-3 (params + grads + opt state all sharded).
+  # Required to actually save memory; SHARD_GRAD_OP only shards grads/opt.
+  fsdp_sharding_strategy: FULL_SHARD
+  fsdp_offload_params: false
+  fsdp_auto_wrap_policy: TRANSFORMER_BASED_WRAP
+  # Actual class names in lerobot's bundled pi_gemma + transformers SigLIP:
+  # _PiGemmaDecoderLayerBase (36x) + SiglipEncoderLayer (27x). 63 wrap groups
+  # is plenty for ZeRO-3 sharding granularity.
+  fsdp_transformer_layer_cls_to_wrap: _PiGemmaDecoderLayerBase,SiglipEncoderLayer
+  fsdp_backward_prefetch: BACKWARD_PRE
+  fsdp_forward_prefetch: false
+  fsdp_use_orig_params: true
+  fsdp_cpu_ram_efficient_loading: true
+  fsdp_sync_module_states: true
+use_cpu: false

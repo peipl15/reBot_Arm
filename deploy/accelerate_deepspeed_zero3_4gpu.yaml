@@ -1,0 +1,43 @@
+# accelerate config — DeepSpeed ZeRO-3 across 4 GPUs for pi0.5 full fine-tune.
+#
+# Why DeepSpeed instead of FSDP? FSDP failed on pi05 because pi05 has:
+#   - mixed dtype params (params_to_keep_float32) → FSDP rejects
+#   - custom checkpoint forward (_apply_checkpoint) → FSDP flat_param indexing
+#     produces empty tensors on some ranks
+# DeepSpeed ZeRO-3 shards params/grads/optimizer at the Python/PyTorch level
+# without requiring the model to be wrap-friendly, so pi05's custom forward
+# code keeps working.
+#
+# Use with:
+#   accelerate launch --config_file deploy/accelerate_deepspeed_zero3_4gpu.yaml \
+#       scripts/train_vla.py --policy pi05 ...
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+mixed_precision: bf16
+num_processes: 4
+num_machines: 1
+machine_rank: 0
+main_training_function: main
+rdzv_backend: static
+same_network: true
+deepspeed_config:
+  zero_stage: 3
+  # zero3_init_flag=true wraps model construction to shard params at __init__
+  # time. pi05's nested construction (PI05Pytorch → PaliGemma → SigLIP) hits
+  # init_weights() which the deepspeed wrapper doesn't tolerate. Setting it
+  # false makes deepspeed wait until accelerator.prepare() to shard — needs
+  # the full model in RAM first (~14 GB CPU), but lets pi05 build normally.
+  zero3_init_flag: false
+  # offload_optimizer_device: cpu / nvme / none — leave on GPU (we have
+  # enough VRAM with 4× A40 = 192 GB total). CPU offload would let us
+  # fit with fewer cards but ~5× slower.
+  offload_optimizer_device: none
+  offload_param_device: none
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+  # zero3_save_16bit_model: save consolidated bf16 weights at ckpt time
+  # so eval_dp.py / eval_ckpt_loss.py can load the merged ckpt without
+  # needing to rerun under deepspeed. (Otherwise each shard saves its
+  # own piece.)
+  zero3_save_16bit_model: true
+use_cpu: false

@@ -1,0 +1,37 @@
+# accelerate config — DeepSpeed ZeRO-2 across 4 GPUs for pi0.5 full fine-tune.
+#
+# ZeRO-3 (full param sharding) was incompatible with pi05's custom layer
+# init: both FSDP and DS-ZeRO-3 failed in different ways during model
+# construction. ZeRO-2 keeps params replicated on each rank (no Python-side
+# magic) and only shards the optimizer state (m, v buffers) — exactly the
+# 28 GB Adam state that wouldn't fit on single A40.
+#
+# Per-GPU memory at bs=1 with bf16 + grad checkpointing + ZeRO-2 sharded
+# across 4 GPUs:
+#   bf16 params:        7 GB (replicated)
+#   fp32 master:       14 GB (replicated)
+#   bf16 grads:         7 GB (replicated)
+#   fp32 Adam (4-way): ~7 GB (sharded across 4 GPUs)
+#   activations:      ~10 GB (gradient checkpointing on)
+#   ─────────────────────
+#   total:           ~45 GB / 48 GB A40 — tight but should fit
+#
+# If still OOMs, drop to bs=1 without grad checkpointing OR add CPU offload
+# of optimizer state.
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+mixed_precision: bf16
+num_processes: 4
+num_machines: 1
+machine_rank: 0
+main_training_function: main
+rdzv_backend: static
+same_network: true
+deepspeed_config:
+  zero_stage: 2
+  # ZeRO-2 doesn't need zero3_init_flag — params aren't sharded at __init__.
+  offload_optimizer_device: none
+  offload_param_device: none
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 1
+use_cpu: false

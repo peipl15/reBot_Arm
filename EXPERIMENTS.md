@@ -499,72 +499,194 @@ the only honest signal; we will not skip it again.
 
 ---
 
-## Test #3 — VLA-focused improvements + pi0.5 path
+## Test #2 — addendum: pi0.5 LoRA + full-fine-tune attempts (2026-06-21 → 2026-06-23)
 
-(supersedes the earlier "MIT motor mode" Test #3 plan — MIT is deprioritised
-since DP is being retired; we keep the MIT branch as an optional
-side-experiment for the next data collection round, if needed.)
+(Originally planned as Test #3 work but the results inform the same
+dataset/task that Test #2 used, so they belong here. Test #3 proper is now
+about re-running once we have a bigger / more diverse dataset.)
 
-### Two parallel work-streams
+### pi0.5 LoRA on the Test #2 dataset
 
-**A. SmolVLA tuning — try to fix the mid-episode open-loop / precision gap**
+**Setup.** Same 51-episode pick_tape_v0 dataset, no relabeling, no new
+demos. Adapter-only fine-tune via PEFT, lerobot 0.5.1 on jiagpu8_yz A40s.
+Compatibility patches required (all in train_vla.py / eval_dp.py /
+eval_ckpt_loss.py):
+1. `lerobot/pi05_base`'s `policy_preprocessor.json` references a registry
+   step `relative_actions_processor` not registered in our 0.5.1. The
+   actual class `RelativeActionsProcessorStep` IS registered, but under
+   the name `delta_actions_processor`. One-line alias fixes it.
+2. transformers ≥ 4.55 changed `PaliGemmaModel.get_image_features` to
+   return a raw Tensor instead of `BaseModelOutputWithPooling`; pi05's
+   `embed_image` reads `.pooler_output` and crashes. Patched to call
+   `vision_tower(image).last_hidden_state` directly (still goes through
+   `multi_modal_projector` so feature dim is correct).
+3. transformers ≥ 4.55 also renamed `create_causal_mask`'s
+   `inputs_embeds` kwarg to `input_embeds`. Wrapped to accept both.
+4. LoRA ckpts only persist the adapter (~36 MB at r=16, ~110 MB at r=64).
+   At eval time we load `lerobot/pi05_base` + `PeftModel.from_pretrained`
+   on the adapter dir. lerobot's `PreTrainedPolicy.wrap_with_peft` only
+   creates a fresh adapter from a `PeftConfig`; it can't load an
+   already-trained adapter. We use PEFT's own `PeftModel.from_pretrained`.
+5. The base ckpt's `input_features` references pi05's original training
+   data names (`base_0_rgb`, `left_wrist_0_rgb`, etc.). Our adapter was
+   trained against our names (`third_person`, `wrist`). After loading
+   base + adapter, overwrite `policy.config.input_features` /
+   `output_features` from the trained ckpt's own config.json.
+6. Local 12 GB RTX 3500 Ada can't hold pi05 in fp32 (~12 GB weights
+   alone). Detect available VRAM, set `PI05Config.dtype="bfloat16"` for
+   inference under 24 GB. A40 (48 GB) is unaffected.
 
-Levers to try (rank-ordered by expected ROI):
+After these patches: training works, inference works, val MSE computable.
 
-1. **Drop SmolVLA `n_action_steps` from 50 → 20 or 10.** Direct attack on G3
-   / G4. More frequent re-planning means image saliency contributes more
-   often, less coasting through OOD mid-states. Cost: more compute per
-   second + slightly less smooth output. Likely worth `--n-action-steps 20`
-   for a first try.
-2. **Re-collect demos with object-position randomization.** 51 demos with
-   j1 base range only 1.30 rad means SmolVLA only sees one narrow region.
-   Goal: 100 demos with an 8×8 (or similar) grid of object placements
-   covering the reachable workspace. Phase tags (approach/grasp/lift/
-   place/release) added in `relabel_grasp.py`-style post-processing.
-3. **Add an explicit grasp-event signal to the dataset** (we already wrote
-   `relabel_grasp.py` for this — 46/51 of the Test #2 dataset got tagged).
-   Either train SmolVLA with the grasp event as an auxiliary output (multi-
-   task regularisation), or use it to trim post-grasp tails from training
-   data.
-4. **Try MIT motor mode for the new data collection,** for cleaner tracking
-   dynamics. Optional. The motor mode is independent of the model — we can
-   compare SmolVLA-trained-on-POS_VEL vs SmolVLA-trained-on-MIT on the
-   same task.
-5. **Sweep `--task-prompt`.** During SmolVLA fine-tuning the prompt was
-   `"pick_tape"`. At eval we used the same. Try at deploy:
-   `"pick up the black tape and place it in the silver box"` —
-   longer/richer prompt may activate different VLM priors.
+**Results.**
+| step | r=16 train | r=16 val | r=64 train | r=64 val |
+|---|---|---|---|---|
+| 5K  | 0.044 | 0.0704 | 0.057 | **0.0582** |
+| 10K | 0.038 | 0.0605 | 0.040 | 0.0637 |
+| 15K | 0.033 | **0.0568** | 0.033 | 0.0632 |
+| 20K | 0.030 | 0.0580 | 0.029 | 0.0620 |
+| 25K | 0.026 | 0.0640 | 0.025 | 0.0641 |
+| 30K | 0.025 | 0.0629 | 0.024 | 0.0646 |
 
-**B. Get pi0.5 working — the lerobot 0.5 ckpt loading problem**
+Compare to Test #2: DP_D val 10K 0.481 / 50K 1.043; SmolVLA val 30K 0.011.
+The pi0.5 val numbers and SmolVLA val numbers are NOT directly comparable
+because the loss is in different normalised spaces (different
+`policy_postprocessor.json` per model); only the *trend within each model*
+is comparable.
 
-Two paths:
+**Findings.**
 
-1. **Self-host a pi0.5 ckpt that matches our installed lerobot 0.5.1.**
-   Fine-tune the official `lerobot/pi05_base` weights via `train_vla.py`
-   on the server, save the resulting ckpt with our installed lerobot
-   version → the saved `policy_preprocessor.json` references only steps
-   our registry has. But this requires the BASE load itself to succeed,
-   which currently fails on `relative_actions_processor`. So:
-2. **Patch the registry to alias `relative_actions_processor` → an
-   existing step.** The list of available steps includes
-   `absolute_actions_processor` and `delta_actions_processor`. From the
-   semantic, "relative" is probably equivalent to "delta_actions_processor".
-   Register an alias decorator under that name and re-try the load.
+**H1. Both LoRA ranks plateau around val MSE 0.057–0.058.** r=16 reaches
+best at step 15K, r=64 at step 5K. After their respective bests, val MSE
+rises (mild overfit, not catastrophic like DP). Increasing rank from 16
+to 64 only changed the speed-to-peak, not the peak itself — within 0.001.
+**This is evidence the bottleneck is NOT LoRA capacity but data.** With
+41 training episodes covering j1 ∈ [−0.9, +0.4] rad and j5 std 0.12 rad,
+the policy literally hasn't seen the workspace it would need to
+generalise.
 
-Order: try B.2 first (a one-line lerobot patch). If that lets the model
-load + train, the resulting ckpt is automatically compatible. If pi0.5
-turns out structurally incompatible with 0.5.1, we either build lerobot
-from main (rebuild the whole `.venv_le05`) or revisit when 0.5.2 drops.
+**H2. Real-arm: pi0.5 r=16 step 15K finds the tape and the silver box.**
+First model in Test #2 that gets the geometry right and reaches a real
+target. Failure mode is not "doesn't know where to go" (DP / SmolVLA-mid-
+coast) but "approaches but doesn't grasp precisely". The tape is a HOLLOW
+ring → correct grasp = one finger inside, one outside. The policy
+positions the gripper *adjacent* to the tape, not straddling it. A first
+real-arm test was actually misleading because room lighting was different
+from training data; once lighting was matched the model performed as
+above. Recording this gotcha: **always confirm lighting matches training
+conditions before declaring a model dead.**
+
+**H3. r=64 real-arm: same coarse behaviour as r=16, no precision gain.**
+Confirms H1 from a different angle. Capacity isn't the bottleneck;
+collecting demos that cover the grasp geometry (workspace diversity +
+consistent "one finger inside ring" demonstration) is the bottleneck.
+
+### Why we tried full fine-tune (and why it didn't work yet)
+
+If LoRA r=64 is capacity-limited (alternate hypothesis), full bf16
+fine-tune would reach lower val. We tried four routes; all failed on
+pi05's design choices, not on our compute. Documenting so the next
+attempt doesn't repeat the same dead ends:
+
+| Attempt | Failure mode |
+|---|---|
+| Single A40 + bf16 mixed precision | OOM at `optimizer.step` Adam state alloc (~28 GB for m+v on top of weights/grads/activations) |
+| FSDP bf16 (mixed precision: bf16) | `ValueError: Must flatten tensors with uniform dtype but got torch.bfloat16 and torch.float32` — pi05 explicitly keeps `vision_tower`, `multi_modal_projector`, `*layernorm`, `model.norm` in fp32 even when policy `dtype="bfloat16"`; FSDP's flat_param wants uniform dtype per shard |
+| FSDP fp32 | `RuntimeError: size mismatch, mat (712x2048), vec (0)` — pi05's `_apply_checkpoint` + `_PiGemmaDecoderLayerBase` custom forward produces a 0-shape tensor on some ranks under FSDP's sharded-param view |
+| DeepSpeed ZeRO-3 (zero3_init_flag=true) | `ValueError: Fan in and fan out can not be computed for tensor with fewer than 2 dimensions` during transformers `init_weights` — DeepSpeed's __init__-time param wrapper hits pi05's custom layers wrong |
+| DeepSpeed ZeRO-3 (zero3_init_flag=false) | Same fan-in/fan-out error — moving sharding to `accelerate.prepare()` time doesn't help if model can't pass `init_weights` cleanly |
+| DeepSpeed ZeRO-2 bf16 | `RuntimeError: mat1 and mat2 must have the same dtype, but got Float and BFloat16` during forward — autocast casts inputs to bf16 but `params_to_keep_float32` layers reject bf16 inputs |
+
+**Root cause.** pi05's modelling code hardcodes `params_to_keep_float32 =
+["vision_tower", "multi_modal_projector", "input_layernorm",
+"post_attention_layernorm", "model.norm"]` and runs a per-parameter dtype
+override in `__init__`. The OpenPI authors deliberately chose this to
+avoid optimizer "same dtype" errors at the optimizer level (their JAX
+training uses a custom optimizer step that handles the mix). The PyTorch
+port (lerobot) inherited this design but **uses standard PyTorch
+optimizers** which forbid mixed dtypes in autocast paths.
+
+For multi-GPU full fine-tune to work, you would need ONE of:
+- Patch pi05 to drop `params_to_keep_float32` (force all bf16 or all fp32).
+  Authors warn this hurts numerical stability on the affected norm layers.
+- Use 8-bit Adam (bitsandbytes) on single GPU to fit Adam state. Doesn't
+  need multi-GPU and sidesteps every dtype problem. ~2h work to install
+  bitsandbytes + patch lerobot's optim factory to use AdamW8bit.
+- Wait for lerobot to ship a pi05-aware distributed training path
+  (probably an `accelerate launch` recipe that handles
+  params_to_keep_float32 via `keep_module_in_fp32` lists).
+
+For now we stop chasing full fine-tune. LoRA r=16 step 15K is our best
+ckpt; the real bottleneck is data.
+
+### What Test #2 actually closed
+- DP fails on this regime (catastrophic, F1–F6 above).
+- SmolVLA partial-completion is data-limited at the precision step, not
+  model-architecture-limited (G1–G4 above).
+- pi0.5 LoRA reaches similar conclusion: capacity not the issue, data
+  diversity is.
+
+---
+
+## Test #3 — VLA on a larger / more diverse dataset (PLANNED)
+
+(supersedes earlier Test #3 plan; MIT motor mode is parked as an
+independent side-experiment.)
+
+### Trigger
+We had 51 demos with j1 sweep 1.3 rad. The data collection rule below was
+the takeaway from all of Test #2 (DP + SmolVLA + pi0.5 LoRA). Once we
+have a richer dataset, re-run.
+
+### Data collection rules (for the next batch)
+1. **Workspace coverage.** Object placements span the reachable area:
+   - j1 base sweep ≥ 2.5 rad across the dataset (was 1.3 rad)
+   - Several placements at extreme left / right / near / far
+   - j5 (wrist yaw) actively used; object orientations ≠ 0 require yaw
+2. **Consistent grasp manoeuvre for hollow ring.** Pick a single grasp
+   style (one finger inside, one outside) and stick to it across all
+   demos. Mixing styles makes the policy oscillate.
+3. **Target placement variation.** Box position also varies, not always
+   fixed.
+4. **Lighting fixed and matches eval room.** Test #2 had a
+   misleadingly-bad result when the eval room had one extra lamp off.
+5. **Volume ≥ 100 demos** (was 51); ≥ 150 if reasonable.
+6. **Grasp event annotation** via `relabel_grasp.py` after collection.
+   The threshold-0.2 detection got 46/51 on the old dataset — should be
+   higher with the prescribed grasp manoeuvre.
+
+### Re-run plan (after data collection)
+Two parallel models, both fine-tuned on the new dataset:
+1. **SmolVLA** — re-run full fine-tune with `n_action_steps=20` (down
+   from default 50, addresses the mid-episode coast finding G3/G4).
+2. **pi0.5 LoRA r=16** — re-run; capacity proved enough on 51 demos, so
+   it should remain enough on ≥ 100. Keep LoRA route until val plateaus
+   non-trivially above 0.05.
+
+Both compared on:
+- Val MSE on a 20-episode held-out split (was 10 on 51 demos)
+- Real-arm eval with **video record + saliency analysis** per the
+  Methodology section. This is the first run for which we should
+  actually execute the saliency-on-real-frames pipeline that we wrote
+  but haven't used yet (`scripts/visualize_attention.py` needs a
+  `--from-mp4` mode for live eval frames; not strictly required, can
+  also pull saliency on saved real-arm frames after).
+
+### Stretch (not blocking Test #3)
+- 8-bit Adam single-GPU pi0.5 full fine-tune (if val plateau is hit
+  again with the larger dataset and LoRA still saturates around 0.05).
+- pi0.5 full fine-tune via patched `params_to_keep_float32` removal.
+- MIT motor mode re-collection / model retraining (side branch).
 
 ### What we will NOT do in Test #3
-- No more DP. Test #2 closed that book. We may keep a single small DP
-  run in future tests strictly as a baseline ablation, but no engineering
-  effort goes into improving it.
-- No more changes to the eval rig itself (rate/vlim/smooth/home-order
-  defaults are settled). The variables in Test #3 are model + data.
+- No more DP. Test #2 closed that book.
+- No more LoRA rank sweeping. Capacity isn't the bottleneck on this
+  dataset; reverify only if new-dataset LoRA r=16 plateaus suspiciously
+  high.
+- No more changes to the eval rig defaults (rate=10, vlim=0.3,
+  smooth=0.6, home-order=4,1,2,3,5,6,7).
 
-### Expected outcome
-A SmolVLA variant that completes the full task chain (approach → grasp →
-lift → place → release) on ≥30% of trials in real-arm eval, OR a pi0.5
-variant doing the same. Pure precision (closing inside 1 cm vs 5 cm) is
-the secondary success criterion.
+### Success criterion
+A model (SmolVLA or pi0.5 LoRA) that **grasps the tape correctly** (one
+finger inside, one outside) on ≥ 30% of real-arm trials, and **places it
+in the silver box** on ≥ half of successful grasps.
