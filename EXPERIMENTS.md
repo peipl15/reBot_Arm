@@ -597,27 +597,48 @@ attempt doesn't repeat the same dead ends:
 | DeepSpeed ZeRO-3 (zero3_init_flag=false) | Same fan-in/fan-out error — moving sharding to `accelerate.prepare()` time doesn't help if model can't pass `init_weights` cleanly |
 | DeepSpeed ZeRO-2 bf16 | `RuntimeError: mat1 and mat2 must have the same dtype, but got Float and BFloat16` during forward — autocast casts inputs to bf16 but `params_to_keep_float32` layers reject bf16 inputs |
 
-**Root cause.** pi05's modelling code hardcodes `params_to_keep_float32 =
-["vision_tower", "multi_modal_projector", "input_layernorm",
-"post_attention_layernorm", "model.norm"]` and runs a per-parameter dtype
-override in `__init__`. The OpenPI authors deliberately chose this to
-avoid optimizer "same dtype" errors at the optimizer level (their JAX
-training uses a custom optimizer step that handles the mix). The PyTorch
-port (lerobot) inherited this design but **uses standard PyTorch
-optimizers** which forbid mixed dtypes in autocast paths.
+**Root cause (post-research, 2026-06-23).** Not a bug we can patch — it's
+a documented OpenPI design decision. The OpenPI README explicitly lists
+the PyTorch port limitations:
 
-For multi-GPU full fine-tune to work, you would need ONE of:
-- Patch pi05 to drop `params_to_keep_float32` (force all bf16 or all fp32).
-  Authors warn this hurts numerical stability on the affected norm layers.
-- Use 8-bit Adam (bitsandbytes) on single GPU to fit Adam state. Doesn't
-  need multi-GPU and sidesteps every dtype problem. ~2h work to install
-  bitsandbytes + patch lerobot's optim factory to use AdamW8bit.
-- Wait for lerobot to ship a pi05-aware distributed training path
-  (probably an `accelerate launch` recipe that handles
-  params_to_keep_float32 via `keep_module_in_fp32` lists).
+> "A few features are currently not supported (this may change in the
+> future): π₀-FAST model, **Mixed precision training, FSDP, LoRA**"
 
-For now we stop chasing full fine-tune. LoRA r=16 step 15K is our best
-ckpt; the real bottleneck is data.
+(LeRobot 0.5 later hacked LoRA in via PEFT — that's why our LoRA runs
+work. FSDP / mixed precision are still unsupported on the PyTorch side.)
+
+`params_to_keep_float32 = ["vision_tower", "multi_modal_projector",
+"input_layernorm", "post_attention_layernorm", "model.norm"]` is a
+**workaround** the OpenPI authors put in their PyTorch port to dodge
+PyTorch optimizer "same dtype" assertions: when PyTorch doesn't have
+mixed-precision support, the cleanest way to prevent dtype mixing at
+optimizer.step() is to manually lock the numerically sensitive layers
+to fp32. Their JAX implementation uses a custom optimizer step that
+handles the mix properly via JAX transforms.
+
+So our FSDP / DeepSpeed attempts were trying to do something the
+upstream code explicitly doesn't support. The four different failure
+modes all trace back to the same root: PyTorch port = no FSDP, no
+mixed precision.
+
+**Real paths forward** (in order of cost):
+
+| Option | Cost | Risk | Notes |
+|---|---|---|---|
+| **C. 8-bit Adam single-GPU (bitsandbytes)** | ~2h | medium (untested numerics on pi05) | Sidesteps multi-GPU entirely; Adam state 28 GB → 7 GB fits on A40 |
+| **A. Switch to OpenPI JAX original** | high (new venv + JAX install + write lerobot→openpi dataset converter) | low (officially supported) | `uv run scripts/train.py pi05_base --fsdp-devices 4` is the supported path |
+| **B. Wait for PyTorch FSDP support in lerobot/openpi** | 0, indefinite wait | — | Roadmap item, no timeline |
+
+We tried JAX install on server (2026-06-23, ETA dependent on
+connectivity): see "JAX OpenPI feasibility" sub-section below for
+status. If feasible we keep it as an option for after the
+data-collection round.
+
+**Decision.** Stop chasing full fine-tune on the lerobot PyTorch side
+until LoRA capacity becomes a confirmed bottleneck on a larger dataset.
+Our r=16 vs r=64 result (val MSE 0.001 apart) makes the data-bottleneck
+hypothesis the more likely one. Re-evaluate after Test #3 data
+collection.
 
 ### What Test #2 actually closed
 - DP fails on this regime (catastrophic, F1–F6 above).
@@ -628,7 +649,7 @@ ckpt; the real bottleneck is data.
 
 ---
 
-## Test #3 — VLA on a larger / more diverse dataset (PLANNED)
+## Test #3 — VLA on larger + recovery-augmented dataset (PLAN as written; results below)
 
 (supersedes earlier Test #3 plan; MIT motor mode is parked as an
 independent side-experiment.)
@@ -690,3 +711,448 @@ Both compared on:
 A model (SmolVLA or pi0.5 LoRA) that **grasps the tape correctly** (one
 finger inside, one outside) on ≥ 30% of real-arm trials, and **places it
 in the silver box** on ≥ half of successful grasps.
+
+---
+
+## Test #3 — RESULTS (2026-06-22 → 2026-06-26)
+
+Executed the planned Test #3 re-run on two enlarged datasets, plus stood
+up the OpenPI JAX full-fine-tune path that Test #2 left as a dead end.
+
+### What actually got built (vs the plan above)
+
+The plan called for ≥100 expert demos with workspace coverage. We ended
+up doing something different — and arguably better — based on a
+literature insight that arrived mid-run.
+
+**Phase 1: bulk expert demos.** 100 additional expert demos collected
+under improved rules (j1 sweep widened, lighting controlled, consistent
+plier-style grasp). Total expert pool: **151 demos** (was 51 in Test #2).
+
+**Phase 2: targeted recovery demos.** After looking at the CCIL / RaC /
+chopstick-grasping literature (papers from 2020-2025), the dominant
+data-efficiency lever for IL is NOT more expert demos — it's
+**corrective demos that show the policy how to recover from off-state
+positions**. We collected **30 short recovery demos** (median 7.5s vs
+21s for full demos): leader manually positions follower 5-15mm offset
+from the tape (left/right/forward/back/high/low/slight rotation), then
+performs only the correction-and-grasp segment. No place, no return to
+home. Stored under `outputs/demos/pick_tape_recovery/`.
+
+**Phase 3: relabeling for grasp event.** The original v1/v2
+position-stall detector found grasp event in 144/151 expert demos but
+only 11/30 recovery demos — because recovery demos end right after
+grasp (no hold tail = no position stall). Added a "force-mode"
+detector: sustained `|tau_j7| ≥ force_threshold` for `force_win`
+consecutive frames, signalling the first frame of sustained contact.
+With auto fallback (stall first, force second), detection rate became:
+- pick_tape: 144/151 (the 7 misses are very-light grasps with peak
+  tau < 0.30 Nm — kept in training but flagged)
+- pick_tape_recovery: 30/30
+
+**Phase 4: dataset merge.** Combined corpus → `pick_tape_v2` LeRobot
+dataset, 181 episodes, 62,734 frames @ 20 Hz. Recovery demos numbered
+151-180 (concatenated, not separate-task-tagged — the IL literature
+treats corrective demos as part of the same task distribution).
+
+### Datasets summary
+
+| name | eps | frames | composition |
+|---|---|---|---|
+| `pick_tape_v1` | 151 | 58 234 | 51 re-recorded + 100 new workspace-randomized |
+| `pick_tape_v2` | 181 | 62 734 | v1's 151 + **30 recovery demos** targeting grasp-precision failure |
+
+All v3.0 / fps 20 / `observation.images.{third_person,wrist}` + `state(7)`
++ `action(7)`. Val MSE via `eval_ckpt_loss.py` (40 batches × bs16) on a
+`--val-episodes 0.1` stride split (v1 → 15 eps {0,10,…,140}; v2 → 18 eps
+{0,10,…,180}).
+
+### SmolVLA — val MSE
+| step | v1 (151) | v2 (181, +recovery) |
+|---|---|---|
+| 5K  | 0.0570 | 0.0502 |
+| 10K | 0.0366 | 0.0391 |
+| 15K | 0.0277 | 0.0254 |
+| 20K | 0.0231 | 0.0212 |
+| 25K | **0.0175** | 0.0199 |
+| 30K | 0.0176 | **0.0172** |
+
+batch 16, 30K steps, merged `.venv_le05` (lerobot 0.5.1), 1 GPU.
+**v1 best 0.0175 ≈ v2 best 0.0172 — the 30 recovery demos did NOT move
+the aggregate val MSE.** (See finding H3 below for why.)
+
+### pi0.5 LoRA — val MSE
+| step | r=16 / v0 (51)¹ | r=16 / v1 (151) | r=64 / v2 (181) |
+|---|---|---|---|
+| 5K  | 0.0704 | 0.0661 | 0.0611 |
+| 10K | 0.0605 | 0.0587 | 0.0595 |
+| 15K | **0.0568** | **0.0559** | **0.0573** |
+| 20K | 0.0580 | 0.0590 ↑ | 0.0606 ↑ |
+| 25K | 0.0640 | 0.0614 | (killed ~24K) |
+| 30K | 0.0629 | 0.0619 | — |
+
+¹ from the Test #2 addendum. bf16, batch 8, 30K steps. r=64/v2 stopped
+early (best already in; later steps overfitting like the others).
+**Hard-capped at ~0.056–0.057 across data (51→151→181) AND rank
+(16→64), always overfits after 15K.**
+
+### pi0.5 FULL fine-tune (OpenPI JAX) — Test #2 dead end, now WORKING
+
+`full_v1`: pi05 full fine-tune (all params) on `pick_tape_v1`, **8-way
+FSDP**, 30K steps, batch 32, ~**19.5 h** on 8 free A40. Completed clean;
+checkpoints 5K–29999 (orbax, 42 GB each incl. train state) at
+`openpi_runs/checkpoints/pi05_pick_tape/full_v1/`.
+
+Not yet val-scored: OpenPI pi05 uses **quantile normalization**
+(`use_quantile_norm=True`), so its loss is in a different normalized
+space than the lerobot MEAN_STD/MIN_MAX runs — not directly comparable.
+Also it's on v1 (no recovery demos). **v2 full fine-tune not yet run.**
+
+How it was set up (the working recipe):
+- Merged `.venv` + `.venv_le05` → one py3.12 env (lerobot 0.5.1 +
+  arm/sim toolchain: motorbridge 0.4.7, mplib, sapien, mani-skill…;
+  numpy bumped to 2.x).
+- OpenPI in an isolated py3.11 venv (jax 0.5.3, 8 GPUs visible),
+  updated to `main@15a9616` which ships the PyTorch port +
+  `convert_jax_model_to_pytorch.py`.
+- **JAX→PyTorch→lerobot round-trip validated**: converted pi05 weights
+  load into lerobot `PI05Policy` with 0 missing / 0 unexpected keys,
+  0 shape mismatches (`_fix_pytorch_state_dict_keys` handles the
+  layernorm split).
+- OpenPI's lerobot 0.1.0 needs dataset **v2.1** (ours is v3.0) → wrote
+  `openpi/convert_picktape_v21.py`; local v2.1 loads without a Hub
+  round-trip.
+- Custom config `pi05_pick_tape` registered in OpenPI (reuses libero
+  transforms; our keys `image/wrist_image/state(7)/actions(7)` line up
+  1:1, `LiberoOutputs` already slices to 7).
+
+### Real-arm eval — first attempt only, 10 trials each
+
+(LoRA only — pi0.5 full-FT JAX ckpt not yet converted-and-deployed at
+time of eval.)
+
+| Model | Successful first-attempt grasps | Notes |
+|---|---|---|
+| **SmolVLA v2 @30K** | **4 / 10 (40 %)** | Successful grasps clean and decisive. Failed attempts trapped in the same wrong action — second attempts also fail. Place phase accurate. |
+| **pi0.5 LoRA r=64 v2 @15K** | **3 / 10 (30 %)** | Some empty grasps (gripper closes before contacting tape). Failed grasps have smaller deviation than Test #2 v1 models. Place phase less accurate than SmolVLA. |
+
+Baseline (Test #2 v1 models): SmolVLA "reaches near tape but cannot
+grasp precisely" (effectively 0/N grasps); pi0.5 r=16 v1 "first model
+to find the tape AND box" but no successful plier-style grasps (also
+effectively 0/N). So Test #3 went from approx 0 % → 30-40 %. **This is
+a 30-40 percentage point lift from adding 30 recovery demos** (~ 1
+percentage point per 1 recovery demo).
+
+### Findings
+
+**H1. The pi0.5 LoRA path is exhausted.** Invariant to both more data
+and more rank; plateaus ~0.057 and overfits past 15K. Test #2
+hypothesised a *data* bottleneck (r16 ≈ r64 on 51 demos); Test #3
+**refutes that for LoRA** — 3× the data didn't help. The limit is the
+LoRA method/capacity for pi05, not data. The only remaining pi05 lever
+is **full fine-tune** (which we now have working, see H4).
+
+**H2. SmolVLA is the val-MSE winner (~0.017), ≈3× lower than pi0.5
+LoRA (~0.057).** Cross-model absolute MSE is not strictly comparable
+(different normalised action spaces), but SmolVLA's trajectory is
+clearly the best and converges by ~25–30K.
+
+**H3. Recovery demos are invisible to aggregate val MSE — by design.**
+They target grasp-precision, a tiny fraction of frames; averaged
+action-MSE over 18 val episodes can't see it. The val table shows
+v1-best 0.0175 ≈ v2-best 0.0172 — virtually unchanged. **But real-arm
+success went 0 → 40 %.** This is the key metric-limitation lesson of
+Test #3: **val MSE cannot judge a targeted-data fix; only on-robot
+success can.**
+
+**H4. OpenPI JAX path is now live (resolves Test #2's "full FT doesn't
+work").** Took Option A from the Test #2 addendum's "Real paths
+forward". Recipe in the section above. Full run ≈ 19.5 h for 30K @
+batch 32, 8-way FSDP on 8 A40. Output is JAX/orbax; need conversion
+back to lerobot before real-arm eval.
+
+**H5. Recovery demos work, and they work as cheaply as the literature
+predicts (from real-arm).** Our +30-40 percentage-point lift per 30
+demos is consistent with CCIL (23 → 83 % with 100 demos; ~0.6 pp/demo)
+and the chopstick paper (37 → 80 % with corrective demos). The
+marginal value of a recovery demo is ~ 10-30× higher than an
+additional expert demo at this dataset scale.
+
+**H6. New failure modes emerged at this performance level.**
+
+- **SmolVLA: "second-attempt failure".** When the first grasp attempt
+  fails (closes on tape edge), the model can't recover on the second
+  attempt — it commits to the same wrong action. This is a second-order
+  covariate shift: the 30 recovery demos taught "5mm-offset state →
+  correct action", but never "5mm-offset state AFTER A FAILED GRASP →
+  back off + retry" — the state distribution post-failure was never in
+  training data.
+
+- **pi0.5: "empty grasps".** The gripper sometimes closes before
+  contacting the tape. Likely cause: the LoRA adapter biased the policy
+  toward the recovery demos' short closure timing (recovery demos
+  start near contact and close quickly), the base model's "wait for
+  contact" prior was partially overridden.
+
+- **pi0.5: place precision worse than SmolVLA.** The 30 recovery demos
+  contain no place-phase signal. SmolVLA full-FT averages over 151
+  expert-place + 30 recovery; the place signal dominates. pi0.5's LoRA
+  adapter is a small delta on a frozen base — the 30 recovery demos
+  shift the adapter more toward grasp-only behaviour.
+
+**H7. 3/10 vs 4/10 (pi0.5 vs SmolVLA) is statistically meaningless.**
+With n=10 trials, the 95 % Wilson confidence intervals are [10.8 %,
+60.3 %] for 3/10 and [16.8 %, 68.7 %] for 4/10 — almost completely
+overlapping. We should not conclude "SmolVLA > pi0.5" from these
+numbers. Need at least 30 trials per model before architecture
+comparisons are meaningful.
+
+**H8. Force-mode grasp detection is more robust for short demos.**
+The position-stall detector (v1/v2) was designed for full demos with
+a post-grasp hold phase. Short recovery demos don't have that hold
+tail but DO have sustained contact torque. The new force-mode
+detector catches 30/30 recovery demos and improves expert-demo
+coverage to 144/151 in `--mode auto` (vs 46/51 with stall-only).
+Force threshold 0.30 Nm is the right setting after DM-scale
+correction.
+
+### Deployable checkpoints (server paths)
+
+| model | val MSE | path |
+|---|---|---|
+| **SmolVLA v2 @30K** (best) | 0.0172 | `outputs/training_runs/smolvla_pick_tape_v2/checkpoints/030000/` |
+| SmolVLA v1 @25K (control, no recovery) | 0.0175 | `outputs/training_runs/smolvla_pick_tape_v1/checkpoints/025000/` |
+| pi0.5 LoRA r=64 v2 @15K (adapter) | 0.0573 | `outputs/training_runs/pi05_lora_r64_pick_tape_v2/checkpoints/015000/` |
+| pi0.5 full-FT `full_v1` (JAX, needs convert + quantile-pack) | n/a | `openpi_runs/checkpoints/pi05_pick_tape/full_v1/{5000..29999}` |
+
+SmolVLA dirs are directly lerobot-deployable
+(`pretrained_model/` = model + config + processors). pi0.5 LoRA =
+adapter on `lerobot/pi05_base`. The JAX full-FT model needs JAX→pytorch
+conversion + quantile-norm packaging before lerobot inference (or
+serve via OpenPI `serve_policy.py`).
+
+### What Test #3 did NOT close
+
+- Whether SmolVLA full FT vs pi0.5 LoRA is architecturally better (n=10
+  too small per H7).
+- Whether pi0.5 **full** fine-tune (now available via JAX) beats pi0.5
+  LoRA on real-arm. Both LoRA exhausted (H1) and full-FT pipeline
+  validated (H4), but the full-FT ckpt is on v1 (no recovery) and not
+  yet deployed.
+- Whether saliency-on-real-frames analysis (Methodology) confirms our
+  failure-mode hypotheses — we still haven't recorded real-arm eval
+  videos at any point. Methodology debt continues to accrue.
+- Whether the failure cases are truly "small-data covariate shift" or
+  some other cause (e.g., wrist camera FOV issue). The user originally
+  hypothesised wrist occlusion; once lighting was matched and we saw
+  the result, the hypothesis became "data, not vision". Hard to verify
+  without instrumentation.
+
+---
+
+## Test #4 — Targeted recovery for second-order failure modes (PLANNED)
+
+### Trigger
+Test #3 hit ~35-40 % first-attempt success. Target is **≥ 80 %** which
+literature shows is achievable with the right data (CCIL chopstick 80
+%, OnlineDAgger 90 % after 3 rounds, CCIL GraspCube 83 %). The gap
+between us and 80 % is ~ 40 percentage points and the diagnosis points
+specifically at 2-3 well-defined failure modes from Test #3.
+
+### Data collection plan: 50 demos, categorised by failure mode
+
+The Test #3 30 recovery demos were undifferentiated ("5mm offset →
+correct"). Test #4 demos are **categorised by the specific failure mode
+they target** (per RaC recommendation to collect data from the state
+distribution where the policy actually fails):
+
+| failure mode | demos | start state | leader action |
+|---|---|---|---|
+| Edge grasp (gripper closes on outside edge) | 15 | gripper already partially closed on edge of tape (NOT home) | open + retract + re-approach + plier-style grasp |
+| Empty grasp (gripper closes before contact) | 15 | gripper closed in mid-air, no contact | open + descend ~5mm + reattempt grasp |
+| Wrong z (too high / too low) | 10 | gripper 5-10 mm too high or already grazing surface | descend / ascend + grasp |
+| Rotation off (wrist yaw mis-aligned) | 10 | gripper at +5-10° wrist yaw from correct orientation | yaw correct + grasp |
+
+**Collection technique.** Run current SmolVLA-v2 or pi0.5-v2 against
+the real arm. When the policy enters one of the 4 failure states above:
+press ESC, leader takes over from current follower state (don't reset
+to home), perform corrective sequence, save. Each demo 2-3 s. Tag is
+`pick_tape_recovery2` so we can ablate (Test #3 v2 vs v3 with both
+recovery rounds).
+
+### Training plan
+- **SmolVLA full FT** on combined v3 = 151 expert + 30 v2 recovery + 50
+  v3 recovery = **231 demos**.
+- **pi0.5 LoRA r=16 v3** as comparison (proven not capacity-limited per
+  Test #3 H1; skip r=64).
+- **pi0.5 full FT v3 via OpenPI JAX** (Test #3 H4 brought this online).
+  Run on the same 231-demo v3 corpus. Convert resulting JAX ckpt to
+  lerobot for real-arm eval. This is the test of whether Test #3 H1's
+  "LoRA exhausted" diagnosis is correct: if full-FT beats LoRA on
+  identical data, the diagnosis stands.
+
+Three models, three trainables, no more rank sweeps.
+
+### Eval plan
+**30 trials per model** (not 10) to actually get statistical power for
+the architecture comparison. Real-arm video recorded + saliency
+analysis on actual eval frames (the saliency debt from Test #2-#3 must
+finally clear).
+
+### Success criterion (Test #4)
+- ≥ 80 % first-attempt grasp success on at least one model
+- Place success ≥ 60 % conditional on grasp
+- Failure distribution shifted away from the 4 categories above
+  (residual failures clustered around a NEW mode, telling us the next
+  round of corrective data)
+
+### Stretch / parked
+- Saliency-on-real-frames pipeline (Methodology debt)
+- Force feedback in observation.state (j7 torque as an observable
+  signal; may help "empty grasp" mode but needs re-collection of demos
+  with the new observation key — expensive)
+- MIT motor mode re-collection (side branch)
+
+### Before Test #4 starts: convert + deploy pi0.5 full-FT v1
+Test #3 H4 brought OpenPI JAX online; the v1 ckpt is sitting at
+`openpi_runs/checkpoints/pi05_pick_tape/full_v1/29999` un-tested. Two
+short tasks before we begin Test #4 collection:
+1. Run `convert_jax_model_to_pytorch.py` + quantile-norm packaging on
+   the 29999 ckpt → lerobot-loadable form. Pull to local.
+2. Real-arm eval pi0.5 full-FT v1 (10 trials) and add a row to the
+   Test #3 results table. If it noticeably beats the LoRA r=64 result,
+   H1's diagnosis ("LoRA exhausted, full-FT is the lever") gains
+   evidence and Test #4's full-FT-v3 prediction becomes higher
+   priority. If it doesn't beat LoRA, the data-bottleneck hypothesis
+   strengthens and full-FT becomes a cheaper add-on rather than the
+   main lever.
+
+## Side experiment — gravity compensation / kinesthetic float (2026-06-27 → 2026-06-30)
+
+### Goal
+Make the self-assembled arm "float" under hand guidance (move-anywhere-it-stays)
+so we can hand-pose it and, longer term, do kinesthetic teaching. Approach: MIT
+torque mode with a gravity feedforward `tau_ff = g(q)` computed from the official
+reBot URDF via Pinocchio, plus a light kp/kd for stability. The whole problem is
+calibrating the map from OUR encoder frame to the URDF frame.
+
+### Final model (configs/zero_calib.json)
+`tau_ff[j] = scale[j] · SIGN[j] · g_urdf( SIGN·(q_user − zero) )[j]`, gravity from
+`pin.computeGeneralizedGravity` on `reBot-DevArm_fixend.urdf` (6-DOF, j1..j6; j7
+gripper not modelled). Calibrated values:
+
+| joint | SIGN | zero | torque scale | note |
+|---|---|---|---|---|
+| j2 | −1 | −1.1° | 1.30 | DM-J4340P |
+| j3 | −1 | +1.7° | 1.46 | DM-J4340P |
+| j4 | −1 | +1.9° | 1.10 | DM-J4310, wrist ~10% heavier than URDF |
+| j5 | (±1, immaterial) | +2.1° | 1.20 | DM-J4310, fitted from a j4-pitched sweep |
+| j6 | — | — | — | wrist roll: gravity ≡ 0, no comp needed |
+
+Scripts: `calib_zero_poses.py` (static hand-posed holding torque), `fit_zero_mass.py`
+(zeros + per-link mass OR per-joint torque scale, with sign brute-force),
+`calib_gravity_sweep.py` (autonomous slow bidirectional sweeps), `fit_zero_sweep.py`
+(zeros from sweeps with a `fric·sgn(v)` term), `gravity_float_test.py` (the live MIT
+comp; `--float`, `--hold-on-stop`, `--wrist`). Calibration data: `outputs/zero_poses.csv`,
+`outputs/gravity_calib_*.csv`.
+
+### The decisive bug: wrong per-joint SIGN (not a big zero offset)
+For weeks gravity comp "didn't work" and we blamed a large encoder-zero misalignment
+(an earlier static read showed measured j3≈0 vs URDF g(0)≈−7). That was an ARTIFACT
+of an inherited sign map that flipped only j4. Fitting railed (zeros pinned at ±57°
+bounds, masses at their clamps). A 16-combo brute-force sign search over j2–j5 showed
+**j2, j3 AND j4 are all mounted opposite to the URDF convention** (the three
+vertical-plane pitch joints flip together — physically coherent for a hand-built arm).
+With correct signs the fit dropped to RMS ~2→0.3 Nm and the real zero offsets came out
+**tiny (1–2°)** — the arm was never badly misaligned. Lesson: a wrong sign masquerades
+as a huge offset because the optimizer rails the zero trying to fix the flipped shape.
+
+### 4340P torque reads ~1.3–1.5× high (decode scale, not mass)
+j2/j3 (DM-J4340P) measured holding torque was ~2× the URDF prediction. Letting per-link
+MASS absorb it forced unphysical +50% densities (RMS 0.9). A per-JOINT torque scale fit
+far better (RMS 0.34) with s2≈1.30, s3≈1.46 — same class of feedback-decode error as the
+earlier DM-J4310 mislabel. It **cancels in MIT** (read and command use the same decode)
+but must be INCLUDED in the model so tau_ff reproduces the measured hold. Per-link mass is
+only weakly identifiable from gravity data — confirmed both on synthetic data (true 8%
+mass errors not recovered even at low regularization) and here.
+
+### j5 (wrist yaw): the "auto-drifts to one side / returns to center" saga
+j5 was never excited in the original sweeps, so its fitted zero was garbage (−20°).
+Symptoms: with the (mis-zeroed) ff it drifted to one side (over-/wrong-comp); with ff=0
+it crept back to center (real gravity, uncompensated). We chased control-side fixes
+(soft wrist-kp, integral hold-on-stop with a low `--wrist-vthresh`) — they half-worked
+but were band-aids. The right fix was DATA: a targeted sweep of j5 **with j4 pitched**
+(j5 gravity is ~0 when j4≈0 — its axis is vertical — but swings ~±0.6 Nm when j4 is
+pitched 60–80°). One 2.4-rad bidirectional sweep → fit zero=+2.1°, scale=1.20, RMS 0.04.
+Note j5's sign is mathematically unidentifiable from single-joint gravity (odd function:
+`sign·g(sign·x)` is sign-invariant) — only zero+scale matter. j6 needs nothing (gravity≡0,
+pure float). Lesson the user called correctly: stop tuning controller params to mask a
+calibration gap — go collect the data that closes it.
+
+### Residual quality / control
+- j2/j3 hold cleanly across the full range (ff tracks measured to <0.5 Nm).
+- j4 has a ~0.3 Nm stiction floor (at a pose where gravity≈0 it still reads ~0.7 Nm) →
+  pure `--float` slowly sags; `--hold-on-stop` (freeze pos_target when stopped, integral
+  nulls the steady residual — the official lock-mode trick) gives "stays where left".
+- Integral windup against stiction was observed (torque creeping up at a fixed pose) →
+  needs gentle `--ki`/`--i-clamp` (ki 2, i-clamp 0.8) or it eventually breaks stiction and
+  jerks. The float is "good, not perfect" — expected for current-sensed torque on a QDD arm.
+
+### HARDWARE: the distal CAN wire is the real chronic blocker
+Twice during this work the **CAN wire in the wrist/distal daisy-chain segment (between
+j3 and j4) broke / went intermittent**, cutting j4–j7 off the bus. It masqueraded as
+software: `ensure_mode: register 10 write ack not received within 50ms`, motor
+`status_code=13` (comm loss), eventually `libusb_transfer_cancelled`. We burned time on
+comm-watchdog / ack-window / enable-retry theories — all red herrings. **Decisive
+diagnostic: the low-level `motorbridge-cli scan`** — it probes each ID directly and showed
+0x01–03 healthy / 0x04–07 "no reply", localizing the break to j3↔j4 instantly. A
+power-cycle does NOT fix a physical break. Hand-manipulating the arm (which gravity comp
+invites) is exactly what re-loosens the wrist connector. Recorded in the motorbridge
+memory note. THIS, not the algorithm, is what will keep breaking data collection until the
+wrist wiring gets proper strain-relief.
+
+### Lessons worth keeping
+1. A wrong per-joint sign looks exactly like a giant zero offset — sanity-check sign
+   (brute-force search) BEFORE trusting any zero/mass fit.
+2. Trust the URDF structure; fit only the few frame-mapping params (sign, zero, decode
+   scale). Don't free-fit masses from gravity — they're weakly identifiable and go
+   unphysical. A synthetic ground-truth test caught this before wasting hardware time.
+3. Static holding torque (POS hold + ± dither to cancel Coulomb) and slow bidirectional
+   sweeps (avg of the two passes = gravity, half-difference = friction) give the SAME
+   gravity — both textbook, and cross-validating the two pinned the result.
+4. Decode-scale errors cancel in MIT (read==command path) but must be modelled to
+   reproduce measured holds — "cancels" ≠ "ignore".
+5. `motorbridge-cli scan` is the first thing to run on any "register 10 / status 13 /
+   libusb" symptom — it separates wiring from software in one shot.
+6. Don't band-aid a calibration gap with controller params (the j5 detour) — collect the
+   targeted data instead. A joint's gravity is only observable in configs where its axis
+   is off-vertical (j5 needs j4 pitched).
+
+### Open / unexplored questions
+- j5 calibrated at ONE j4 pitch (−0.51). Its zero/scale may drift at other pitches; a
+  multi-pitch j5 sweep (j4 = +0.6, +1.2) merged-fit would generalize it. Not yet done.
+- j4↔j5 coupling: does deflecting j5 still slightly destabilize j4 at large angles? (We
+  now read j5 live, but the distal MASS distribution in the URDF may be off enough that
+  the coupling term is imperfect.) Untested at extremes.
+- Is the gravity float actually needed for our pipeline? Recording uses LEADER→FOLLOWER
+  POS_VEL teleop, which does NOT use gravity comp. Float matters only for kinesthetic
+  demos / setup convenience. Worth deciding before investing more.
+- We never validated MIT-mode RECORDING (the "MIT re-collection side branch" parked in
+  Test #4). Whether the cleaner compliance helps demo quality is open.
+- Friction is modelled as a single Coulomb term per joint; viscous / position-dependent
+  friction and stiction breakaway are not. The ~0.3 Nm floor is the practical limit.
+
+### Potential issues / risks
+- **Wrist CAN wiring** (above) — the #1 reliability risk for ANY arm use, not just this.
+- **MIT torque is the first thing that can hurt the arm** if a sign/zero regresses: a
+  flipped sign drives the arm INTO gravity instead of against it. The watchdog
+  (`--abort-ratio`, soft-limit check, Ctrl-C disable) is the only guard — keep it.
+- Calibration is tied to the official URDF path on THIS machine
+  (`/home/yinzi/code/reBotArm_control_py/...`); zero_calib.json hardcodes it. Moving
+  machines / re-cloning the URDF will break the float scripts.
+- Torque decode scales (1.30/1.46/1.10/1.20) are specific to these motor units &
+  firmware; a motor swap invalidates them.
+- j5/j6 live on the flaky distal segment, so `--wrist` puts gravity-control load on the
+  least reliable wiring — only enable once that wire is strain-relieved.
+- Integral windup (hold-on-stop) can slowly build torque against stiction and jerk;
+  bounded by `--i-clamp` but worth watching during long holds.

@@ -77,8 +77,8 @@ def parse_args():
                    help="task name; episodes saved to outputs/demos/<task>/")
     p.add_argument("--leader-port", default="/dev/ttyUSB0")
     p.add_argument("--leader-baud", type=int, default=1_000_000)
-    p.add_argument("--c922-index", type=int, default=8,
-                   help="/dev/videoN index for the C922 webcam")
+    p.add_argument("--c922-index", type=int, default=-1,
+                   help="/dev/videoN index for the C922 webcam; -1 = auto-find by name")
     p.add_argument("--c922-width", type=int, default=640)
     p.add_argument("--c922-height", type=int, default=480)
     p.add_argument("--c922-rotate", type=int, default=0, choices=[0, 90, 180, 270],
@@ -246,6 +246,13 @@ def main():
     time.sleep(0.3)
 
     # C922
+    if args.c922_index < 0:
+        from camera_utils import find_camera_index
+        idx = find_camera_index("C922")
+        if idx is None:
+            raise RuntimeError("C922 not found by name (is it plugged in?)")
+        args.c922_index = idx
+        print(f"Auto-detected C922 at /dev/video{idx}")
     print(f"Opening C922 on /dev/video{args.c922_index} at "
           f"{args.c922_width}x{args.c922_height}...")
     cap = cv2.VideoCapture(args.c922_index)

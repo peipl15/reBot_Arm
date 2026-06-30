@@ -42,7 +42,11 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-RELABEL_VERSION = "v1"
+# v2: recomputed on DM-scale-corrected torque (scripts/fix_dm_scale.py).
+# v1 ran on j4-j7 torque that was 2.8x inflated (DM-J4340 mislabel); its 0.5 Nm
+# threshold was therefore an effective ~0.18 Nm in true units. v2 applies that
+# same true-unit threshold (--torque-threshold 0.18) uniformly to all episodes.
+RELABEL_VERSION = "v2"
 
 # Leader gripper sits at column 6 in `leader_deg` (SERVO_IDS=[0..6], gripper
 # maps via JOINT_MAP[6]). Follower gripper sits at column 6 in
@@ -69,30 +73,41 @@ def parse_args():
                    help="rad. Follower gripper movement smaller than this counts as stalled (0.005 rad ≈ 0.3°).")
     p.add_argument("--commanded-close-eps", type=float, default=0.005,
                    help="rad. The action target must be more negative than current follower pos by at least this (gripper closes in -rad direction).")
-    p.add_argument("--torque-threshold", type=float, default=0.5,
-                   help="Nm. Min |follower_torq[j7]| at the stall window to call it 'real contact'.")
+    p.add_argument("--torque-threshold", type=float, default=0.15,
+                   help="Nm. Min |follower_torq[j7]| at the stall window to call it "
+                        "'real contact'. v2 default 0.15: tape grasps are light "
+                        "(median contact ~0.20 Nm, noise floor ~0.08 after the "
+                        "DM-J4310 scale correction). 0.15 catches the canonical "
+                        "ep0 (true grasp torque 0.164 Nm) and sits ~2x the floor.")
     p.add_argument("--min-ratio", type=float, default=0.10,
                    help="reject detections in the first N%% of the episode "
                         "(grasp can't physically happen in the approach phase; "
                         "0.10 = grasp must be after frame n_frames*0.10).")
+    p.add_argument("--mode", default="auto",
+                   choices=["stall", "force", "auto"],
+                   help="Detection mode:\n"
+                        "  stall: position stalls for stall_win frames with tau>thresh (original v1/v2)\n"
+                        "  force: sustained torque >= force_threshold for force_win frames\n"
+                        "         (works on short recovery demos that don't have a hold tail)\n"
+                        "  auto:  try stall first, fall back to force if not detected.")
+    p.add_argument("--force-threshold", type=float, default=0.30,
+                   help="Nm. For mode=force: minimum |tau_j7| during the sustained window.")
+    p.add_argument("--force-win", type=int, default=10,
+                   help="# of consecutive frames tau must stay >= force_threshold "
+                        "(default 10 = 0.5s @ 20Hz).")
     return p.parse_args()
 
 
-def detect_grasp(action, follower_pos, follower_torq, args):
-    """Return (grasp_frame, tau_at_event) or (-1, 0.0)."""
+def _detect_stall(action, follower_pos, follower_torq, args):
+    """Original v1/v2 detector: position stall + commanded_close + tau threshold.
+    Works well on full demos that have a hold tail after grasp."""
     n = len(action)
     g_act = action[:, FOLLOWER_GRIPPER_COL]
     g_pos = follower_pos[:, FOLLOWER_GRIPPER_COL]
     g_tau = follower_torq[:, FOLLOWER_GRIPPER_COL] if follower_torq is not None else np.zeros(n)
 
-    # commanded_close[t] = the policy/leader wants the gripper to close further at t
-    # In our convention, gripper closes in the negative-rad direction.
     commanded_close = (g_pos - g_act) > args.commanded_close_eps
-
-    # Reject detections before n_frames * min_ratio (approach phase).
     t_min = int(n * args.min_ratio)
-
-    # Simple sweep, O(n * stall_win)
     for t in range(t_min, n - args.stall_win):
         if not commanded_close[t]:
             continue
@@ -103,8 +118,39 @@ def detect_grasp(action, follower_pos, follower_torq, args):
         if tau_max < args.torque_threshold:
             continue
         return t, tau_max
-
     return -1, 0.0
+
+
+def _detect_force(action, follower_pos, follower_torq, args):
+    """Force-plateau detector: tau stays above force_threshold for force_win
+    consecutive frames. Works on short recovery demos that end right after
+    contact (no hold tail). Triggers at the FIRST frame where the sustained
+    high-torque region starts."""
+    n = len(action)
+    if follower_torq is None:
+        return -1, 0.0
+    g_tau = np.abs(follower_torq[:, FOLLOWER_GRIPPER_COL])
+    t_min = int(n * args.min_ratio)
+    for t in range(t_min, n - args.force_win):
+        window = g_tau[t : t + args.force_win]
+        if window.min() < args.force_threshold:
+            continue
+        return t, float(window.mean())
+    return -1, 0.0
+
+
+def detect_grasp(action, follower_pos, follower_torq, args):
+    """Return (grasp_frame, tau_at_event) or (-1, 0.0).
+    Dispatches based on --mode."""
+    if args.mode == "stall":
+        return _detect_stall(action, follower_pos, follower_torq, args)
+    if args.mode == "force":
+        return _detect_force(action, follower_pos, follower_torq, args)
+    # auto: try stall first, fall back to force
+    t, tau = _detect_stall(action, follower_pos, follower_torq, args)
+    if t >= 0:
+        return t, tau
+    return _detect_force(action, follower_pos, follower_torq, args)
 
 
 def process_one(fp: Path, args) -> dict:

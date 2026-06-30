@@ -2,7 +2,7 @@
 name = "rebot-arm"
 version = "0.1.0"
 description = "Python wrapper for Seeed reBot 7-DOF arm via motorbridge (Damiao DM-USB2FDCAN), with leader-arm teleop"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10"
 dependencies = [
     "motorbridge>=0.4.5",
     "pyyaml>=6.0",
@@ -13,7 +13,9 @@ dependencies = [
     "opencv-python>=4.7",     # C922 capture via cv2.VideoCapture
     "pyrealsense2>=2.55",     # D435 RGB + depth
     "h5py>=3.9",              # episode storage
-    "numpy>=1.24,<2.0",       # arrays (also a motorbridge dep)
+    "numpy>=1.24",            # arrays (also a motorbridge dep). No <2.0 cap:
+                              # arm code works on numpy 2.x, and the merged env
+                              # shares lerobot 0.5.1 which requires numpy 2.x.
 ]
 
 [project.optional-dependencies]
